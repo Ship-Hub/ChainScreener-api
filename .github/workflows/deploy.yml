@@ -38,11 +38,13 @@ jobs:
           ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
             "mkdir -p /var/www/chain-screener/api && cd /var/www/chain-screener/api && tar -xzf -"
 
-      - name: Install deps and restart
+      - name: Install deps, migrate and restart
         run: |
           ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "
             set -e
             cd /var/www/chain-screener/api
+            npm ci
+            npm run db:migrate
             npm ci --omit=dev
             pm2 delete chainscreener-api 2>/dev/null || true
             pm2 start dist/server.js --name chainscreener-api
