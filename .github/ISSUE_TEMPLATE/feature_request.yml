@@ -1,0 +1,31 @@
+name: Feature Request
+description: Suggest a new feature or improvement
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: "Thanks for suggesting a feature! Please provide as much context as possible."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      placeholder: What problem does this solve? What is the current limitation?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      placeholder: Describe the solution you would like.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      placeholder: Any alternative approaches you considered?
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      placeholder: Any other context, screenshots, or references.
