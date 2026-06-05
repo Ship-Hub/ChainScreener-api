@@ -10,6 +10,8 @@ export type TokenSummary = {
   name: string;
   logoUrl?: string;
   launchSource: string;
+  /** Platform key if launched via a known launchpad (e.g. "clanker", "bankr") */
+  launchPlatform: string | null;
   dex: string;
   ageMinutes: number;
   lifecycle: TokenLifecycle;

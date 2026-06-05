@@ -1,7 +1,8 @@
-import { listTokens } from "./tokens.js";
+import { listMarketTokens } from "./market.js";
 
-export function listTrending(chain = "all") {
-  return listTokens({ chain })
+export async function listTrending(chain = "all") {
+  const tokens = await listMarketTokens(chain === "all" ? "all" : chain as import("../config/chains.js").ChainKey);
+  return tokens
     .map((token) => ({
       ...token,
       signals: {

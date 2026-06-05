@@ -1,0 +1,50 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy API
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add server to known hosts
+        run: ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Upload source to server
+        run: |
+          tar --exclude='.git' \
+              --exclude='node_modules' \
+              --exclude='.env' \
+              --exclude='logs' \
+              -czf - . | \
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
+            "mkdir -p /var/www/chain-screener/api && cd /var/www/chain-screener/api && tar -xzf -"
+
+      - name: Install deps and restart
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "
+            set -e
+            cd /var/www/chain-screener/api
+            npm ci --omit=dev
+            pm2 delete chainscreener-api 2>/dev/null || true
+            pm2 start dist/server.js --name chainscreener-api
+            pm2 save
+          "

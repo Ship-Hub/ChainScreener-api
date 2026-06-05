@@ -7,6 +7,15 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "indexer:discover": "tsx src/indexer/discoverPools.ts",
+    "indexer:swaps": "tsx src/indexer/ingestSwaps.ts",
+    "indexer:aggregate": "tsx src/indexer/aggregateMarket.ts",
+    "indexer:metadata": "tsx src/indexer/fetchTokenMetadata.ts",
+    "indexer:transfers": "tsx src/indexer/ingestTransfers.ts",
+    "indexer:alerts": "tsx src/indexer/generateAlerts.ts",
+    "indexer:loop": "tsx src/indexer/indexerLoop.ts",
+    "indexer:smart-wallets": "tsx src/indexer/computeSmartWallets.ts",
     "lint": "eslint \"src/**/*.ts\""
   },
   "dependencies": {
@@ -15,7 +24,7 @@
     "bullmq": "^5.34.4",
     "dotenv": "^16.4.7",
     "fastify": "^5.8.5",
-    "pg": "^8.13.1",
+    "postgres": "^3.4.9",
     "viem": "^2.21.53",
     "zod": "^3.24.1"
   },

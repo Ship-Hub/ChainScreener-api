@@ -1,5 +1,6 @@
 import { isChainKey, type ChainKey } from "../config/chains.js";
 import { seedCandles, seedHolders, seedSwaps, seedTokens } from "../data/seedTokens.js";
+import { getWalletTrackingPolicy, type WalletTrackingTier } from "./retention.js";
 import type { TokenSummary } from "../types/token.js";
 
 export type TokenFilters = {
@@ -56,16 +57,27 @@ export function getTokenRisk(chain: string, address: string) {
 }
 
 export function getTokenPnl(chain: string, address: string) {
-  if (!getToken(chain, address)) return undefined;
-  return seedHolders.slice(0, 8).map((holder, index) => ({
-    wallet: holder.wallet,
-    totalBoughtUsd: Math.round(4_000 + index * 1_850),
-    totalSoldUsd: Math.round(900 + index * 920),
-    currentHoldings: holder.balance,
-    realizedPnlUsd: Math.round(holder.pnlUsd * 0.45),
-    unrealizedPnlUsd: Math.round(holder.pnlUsd * 0.55),
-    roiPct: Number((holder.pnlUsd / 10_000).toFixed(2)),
-  }));
+  const token = getToken(chain, address);
+  if (!token) return undefined;
+
+  return seedHolders.slice(0, 8).map((holder, index) => {
+    const trackingTier = holderTier(index);
+    const trackingPolicy = getWalletTrackingPolicy(trackingTier, token.lifecycle);
+
+    return {
+      wallet: holder.wallet,
+      trackingTier,
+      trackingMode: trackingPolicy.mode,
+      retentionReason: trackingPolicy.reason,
+      detailedHistoryRetained: trackingPolicy.mode === "full",
+      totalBoughtUsd: Math.round(4_000 + index * 1_850),
+      totalSoldUsd: Math.round(900 + index * 920),
+      currentHoldings: holder.balance,
+      realizedPnlUsd: Math.round(holder.pnlUsd * 0.45),
+      unrealizedPnlUsd: Math.round(holder.pnlUsd * 0.55),
+      roiPct: Number((holder.pnlUsd / 10_000).toFixed(2)),
+    };
+  });
 }
 
 export function listLaunches(chain?: ChainKey | "all") {
@@ -80,4 +92,12 @@ export function listLaunches(chain?: ChainKey | "all") {
     liquidityUsd: token.liquidityUsd,
     riskLevel: token.riskLevel,
   }));
+}
+
+function holderTier(index: number): WalletTrackingTier {
+  if (index === 0) return "smart_wallet";
+  if (index < 3) return "top_holder";
+  if (index === 3) return "watched_wallet";
+  if (index < 6) return "active_wallet";
+  return "cold_wallet";
 }

@@ -6,21 +6,20 @@ services:
     ports:
       - "4000:4000"
     depends_on:
-      - postgres
+      - mysql
       - redis
 
-  postgres:
-    image: timescale/timescaledb:latest-pg16
+  mysql:
+    image: mysql:8.4
     restart: unless-stopped
     environment:
-      POSTGRES_DB: chain_screener
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      MYSQL_DATABASE: chain_screener
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
     ports:
-      - "5432:5432"
+      - "3306:3306"
     volumes:
-      - chain_screener_pg:/var/lib/postgresql/data
-      - ./db/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - chain_screener_mysql:/var/lib/mysql
+      - ./db/schema.mysql.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
 
   redis:
     image: redis:7-alpine
@@ -31,5 +30,5 @@ services:
       - chain_screener_redis:/data
 
 volumes:
-  chain_screener_pg:
+  chain_screener_mysql:
   chain_screener_redis:
