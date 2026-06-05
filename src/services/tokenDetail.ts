@@ -31,10 +31,19 @@ export type TokenDetail = {
   priceUsd: number;
   priceChange24h: number;
   volume24hUsd: number;
+  liquidityUsd: number;
   swaps24h: number;
   buys24h: number;
   sells24h: number;
   lastActivityAt: string;
+  // Enriched fields
+  launchPlatform: string | null;
+  launchSource: string;
+  dex: string;
+  riskScore: number;
+  riskLevel: "Low" | "Medium" | "High" | "Extreme";
+  lifecycle: "hot" | "warm" | "cold";
+  ageMinutes: number;
 };
 
 export type TokenSwap = {
@@ -68,13 +77,27 @@ export async function getTokenDetail(chain: ChainKey, address: string): Promise<
       COALESCE(t.name, 'Unknown Token')     AS name,
       COALESCE(t.decimals, 18)              AS decimals,
       t.total_supply                        AS "totalSupply",
+      t.launch_platform                     AS "launchPlatform",
       tms.price_usd                         AS "priceUsd",
       tms.price_change_24h_pct              AS "priceChange24h",
       tms.volume_24h_usd                    AS "volume24hUsd",
+      tms.liquidity_usd                     AS "liquidityUsd",
       tms.swaps_24h                         AS "swaps24h",
       tms.buys_24h                          AS "buys24h",
       tms.sells_24h                         AS "sells24h",
-      tms.updated_at                        AS "lastActivityAt"
+      tms.updated_at                        AS "lastActivityAt",
+      (
+        SELECT d.name FROM pools p
+        JOIN dexes d ON d.id = p.dex_id
+        WHERE p.chain_id = tms.chain_id
+          AND (p.token0_address = tms.token_address OR p.token1_address = tms.token_address)
+        ORDER BY p.created_at DESC LIMIT 1
+      ) AS "dexName",
+      (
+        SELECT MIN(p2.created_at) FROM pools p2
+        WHERE p2.chain_id = tms.chain_id
+          AND (p2.token0_address = tms.token_address OR p2.token1_address = tms.token_address)
+      ) AS "poolCreatedAt"
     FROM token_market_stats tms
     JOIN chains ON chains.id = tms.chain_id
     LEFT JOIN tokens t ON t.chain_id = tms.chain_id AND t.address = tms.token_address
@@ -84,8 +107,11 @@ export async function getTokenDetail(chain: ChainKey, address: string): Promise<
 
   if (!rows[0]) return null;
   const row = rows[0];
-  const priceUsd = Number(row.priceUsd);
-  const decimals = Number(row.decimals);
+  const priceUsd    = Number(row.priceUsd);
+  const decimals    = Number(row.decimals);
+  const volume24h   = Number(row.volume24hUsd);
+  const liquidityUsd = Number(row.liquidityUsd) || 0;
+
   let marketCapUsd = 0;
   if (row.totalSupply && priceUsd > 0) {
     try {
@@ -94,6 +120,24 @@ export async function getTokenDetail(chain: ChainKey, address: string): Promise<
       marketCapUsd = 0;
     }
   }
+
+  // Compute age from pool creation date (same logic as market service)
+  const updatedAt = row.lastActivityAt instanceof Date ? row.lastActivityAt : new Date(String(row.lastActivityAt));
+  const poolCreatedAt = row.poolCreatedAt
+    ? (row.poolCreatedAt instanceof Date ? row.poolCreatedAt : new Date(String(row.poolCreatedAt)))
+    : null;
+  const ageMinutes = poolCreatedAt
+    ? Math.max(1, Math.round((Date.now() - poolCreatedAt.getTime()) / 60_000))
+    : Math.max(1, Math.round((Date.now() - updatedAt.getTime()) / 60_000));
+  const ageHours = ageMinutes / 60;
+
+  // Risk scoring (matches market service logic)
+  const isNew    = ageHours < 24;
+  const highVol  = volume24h > 50_000;
+  const riskScore = isNew && !highVol ? 65 : highVol ? 35 : 50;
+  const riskLevel = riskScore < 40 ? "Low" : riskScore < 60 ? "Medium" : "High";
+
+  const launchPlatform = (row.launchPlatform as string | null) ?? null;
 
   return {
     chain: row.chain as ChainKey,
@@ -105,14 +149,19 @@ export async function getTokenDetail(chain: ChainKey, address: string): Promise<
     marketCapUsd,
     priceUsd,
     priceChange24h: Number(row.priceChange24h),
-    volume24hUsd: Number(row.volume24hUsd),
+    volume24hUsd: volume24h,
+    liquidityUsd,
     swaps24h: Number(row.swaps24h),
     buys24h: Number(row.buys24h),
     sells24h: Number(row.sells24h),
-    lastActivityAt:
-      row.lastActivityAt instanceof Date
-        ? row.lastActivityAt.toISOString()
-        : String(row.lastActivityAt),
+    lastActivityAt: updatedAt.toISOString(),
+    launchPlatform,
+    launchSource: launchPlatform ?? "On-chain",
+    dex: (row.dexName as string | null) ?? "Unknown DEX",
+    riskScore,
+    riskLevel: riskLevel as "Low" | "Medium" | "High" | "Extreme",
+    lifecycle: ageHours < 2 ? "hot" : ageHours < 24 ? "warm" : "cold",
+    ageMinutes,
   };
 }
 
