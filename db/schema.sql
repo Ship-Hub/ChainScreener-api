@@ -72,6 +72,9 @@ CREATE TABLE IF NOT EXISTS pools (
   UNIQUE (chain_id, pool_id)
 );
 
+-- Add history_fetched column if upgrading from a schema that predates it
+ALTER TABLE pools ADD COLUMN IF NOT EXISTS history_fetched BOOLEAN NOT NULL DEFAULT FALSE;
+
 CREATE INDEX IF NOT EXISTS idx_pools_chain_block    ON pools (chain_id, block_number);
 CREATE INDEX IF NOT EXISTS idx_pools_tokens         ON pools (chain_id, token0_address, token1_address);
 CREATE INDEX IF NOT EXISTS idx_pools_needs_backfill ON pools (chain_id, dex_id, history_fetched, block_number)
