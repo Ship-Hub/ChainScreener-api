@@ -8,7 +8,9 @@ import { uniswapV2PairAbi, uniswapV3PoolAbi, uniswapV4SwapAbi } from "./protocol
 import {
   finishIndexerRun,
   getCursor,
+  getPoolsNeedingBackfill,
   listIndexedPoolsForDex,
+  markPoolsHistoryFetched,
   setCursor,
   startIndexerRun,
   upsertIndexedSwap,
@@ -29,7 +31,14 @@ export async function ingestSwapsOnce(selectedDexes: DexConfig[] = dexes): Promi
 
   const results: SwapIngestionResult[] = [];
   for (const dex of selectedDexes) {
-    results.push(await ingestDexSwaps(dex));
+    try {
+      results.push(await ingestDexSwaps(dex));
+    } catch (err) {
+      console.warn(
+        `[ingestSwaps] ${dex.key} failed (RPC error?): ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`,
+      );
+      results.push({ dexKey: dex.key, fromBlock: 0n, toBlock: 0n, indexedSwaps: 0 });
+    }
   }
 
   return results;
@@ -45,6 +54,16 @@ async function ingestDexSwaps(dex: DexConfig): Promise<SwapIngestionResult> {
   }
 
   const existingCursor = await getCursor(dex.chain, dex.key, workerName);
+
+  // ── Historical backfill for newly discovered pools ────────────────────────
+  // When a pool is discovered after the main cursor has already advanced past
+  // its creation block, its pre-cursor swaps are silently skipped.
+  // This step detects such pools and fetches their missing history first.
+  if (existingCursor) {
+    await backfillNewPools(dex, pools, existingCursor, safeLatestBlock);
+  }
+
+  // ── Normal forward paging ─────────────────────────────────────────────────
   const newestPoolStart = pools.reduce<bigint | undefined>((min, pool) => {
     if (min === undefined) return pool.blockNumber;
     return pool.blockNumber < min ? pool.blockNumber : min;
@@ -82,6 +101,71 @@ async function ingestDexSwaps(dex: DexConfig): Promise<SwapIngestionResult> {
     await finishIndexerRun(runId, indexedSwaps, error instanceof Error ? error.message : String(error));
     throw error;
   }
+}
+
+/**
+ * Backfills historical swaps for any pool whose creation block predates the
+ * current swap cursor.  Processes up to 5 pools per call, each in pages of
+ * up to BACKFILL_PAGE_BLOCKS to avoid RPC timeouts.
+ */
+const BACKFILL_PAGE_BLOCKS = 2_000n;
+const BACKFILL_POOLS_PER_CYCLE = 5;
+
+async function backfillNewPools(
+  dex: DexConfig,
+  allPools: IndexedPool[],
+  swapCursor: bigint,
+  safeLatestBlock: bigint,
+): Promise<void> {
+  const poolsToFill = await getPoolsNeedingBackfill(dex, swapCursor, BACKFILL_POOLS_PER_CYCLE);
+  if (poolsToFill.length === 0) return;
+
+  const addressToPool = mapPoolsByAddress(allPools);
+  const poolIdToPool  = new Map(allPools.filter((p) => p.poolId).map((p) => [p.poolId!.toLowerCase(), p]));
+
+  for (const pool of poolsToFill) {
+    const fromBlock = pool.blockNumber;
+    // Fetch history up to the cursor (we'll pick up the rest in the main loop)
+    const toBlock   = minBlock(swapCursor, safeLatestBlock);
+    if (fromBlock > toBlock) {
+      await markPoolsHistoryFetched([pool.id]);
+      continue;
+    }
+
+    console.log(
+      `[backfill] ${dex.key} pool ${pool.address ?? pool.poolId ?? pool.id}: ` +
+      `fetching blocks ${fromBlock}–${toBlock} (${toBlock - fromBlock} blocks)`,
+    );
+
+    // Page through the historical range in chunks
+    let cursor = fromBlock;
+    let totalInserted = 0;
+    while (cursor <= toBlock) {
+      const end = minBlock(cursor + BACKFILL_PAGE_BLOCKS - 1n, toBlock);
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let swaps: any[];
+        if (dex.version === "v4") {
+          swaps = await fetchV4Swaps(dex, [pool], cursor, end);
+        } else if (dex.version === "v3") {
+          swaps = await fetchV3Swaps(dex, [pool], cursor, end);
+        } else {
+          swaps = await fetchV2Swaps(dex, [pool], cursor, end);
+        }
+        for (const swap of swaps) {
+          await upsertIndexedSwap(swap);
+          totalInserted++;
+        }
+      } catch (err) {
+        console.warn(`[backfill] ${dex.key} chunk ${cursor}–${end} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      cursor = end + 1n;
+    }
+
+    console.log(`[backfill] ${dex.key} pool ${pool.address ?? pool.poolId ?? pool.id}: inserted ${totalInserted} swaps`);
+    await markPoolsHistoryFetched([pool.id]);
+  }
+
 }
 
 const MAX_ADDRESSES_PER_CALL = 20;

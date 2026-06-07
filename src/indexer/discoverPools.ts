@@ -29,7 +29,20 @@ export async function discoverPoolsOnce(selectedDexes: DexConfig[] = dexes): Pro
 
   const results: DiscoveryResult[] = [];
   for (const dex of selectedDexes) {
-    results.push(await discoverDexPools(dex));
+    try {
+      results.push(await discoverDexPools(dex));
+    } catch (err) {
+      // Per-DEX errors are non-fatal — log and continue to next DEX.
+      console.warn(
+        `[discoverPools] ${dex.key} failed (RPC error?): ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`,
+      );
+      results.push({
+        dexKey: dex.key,
+        fromBlock: 0n,
+        toBlock: 0n,
+        discoveredPools: 0,
+      });
+    }
   }
 
   return results;

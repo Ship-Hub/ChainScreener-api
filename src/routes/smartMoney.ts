@@ -17,9 +17,10 @@ export async function registerSmartMoneyRoutes(app: FastifyInstance) {
   });
 
   app.get("/api/smart-money/leaderboard", async (request) => {
-    const q = request.query as { limit?: string };
+    const q = request.query as { limit?: string; hours?: string };
     const limit = Math.min(50, Math.max(1, parseInt(q.limit ?? "20", 10) || 20));
-    const data = await getSmartMoneyLeaderboard(limit);
+    const hours = Math.min(168, Math.max(0, parseInt(q.hours ?? "0", 10) || 0));
+    const data = await getSmartMoneyLeaderboard(limit, hours);
     return { data };
   });
 

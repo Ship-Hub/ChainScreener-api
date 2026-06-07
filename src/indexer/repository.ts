@@ -148,6 +148,60 @@ export async function upsertDiscoveredPool(pool: DiscoveredPool) {
   `;
 }
 
+/**
+ * Returns pools whose creation block is at or before `swapCursor`
+ * but whose history has not yet been backfilled.
+ */
+export async function getPoolsNeedingBackfill(
+  dex: DexConfig,
+  swapCursor: bigint,
+  limit = 20,
+): Promise<IndexedPool[]> {
+  const sql = getDb();
+  const safeLimit = Math.min(100, Math.max(1, Math.trunc(limit)));
+
+  const rows = await sql`
+    SELECT
+      pools.id,
+      chains."key" AS chain_key,
+      dexes."key"  AS dex_key,
+      pools.protocol_version,
+      pools.address,
+      pools.pool_id,
+      pools.token0_address,
+      pools.token1_address,
+      pools.block_number
+    FROM pools
+    JOIN chains ON chains.id = pools.chain_id
+    JOIN dexes  ON dexes.id  = pools.dex_id
+    WHERE dexes."key" = ${dex.key}
+      AND pools.history_fetched = FALSE
+      AND pools.block_number <= ${swapCursor.toString()}
+    ORDER BY pools.block_number ASC
+    LIMIT ${safeLimit}
+  `;
+
+  return rows.map((row) => ({
+    id: Number(row.id),
+    chain: row.chain_key as ChainKey,
+    dexKey: row.dex_key as string,
+    dex,
+    protocolVersion: row.protocol_version as "v2" | "v3" | "v4",
+    address: (row.address as string | null) ?? undefined,
+    poolId: (row.pool_id as string | null) ?? undefined,
+    token0: row.token0_address as string,
+    token1: row.token1_address as string,
+    blockNumber: BigInt(row.block_number as string),
+  }));
+}
+
+/** Mark one or more pools as fully history-backfilled. */
+export async function markPoolsHistoryFetched(poolIds: number[]): Promise<void> {
+  if (poolIds.length === 0) return;
+  const sql = getDb();
+  await sql`UPDATE pools SET history_fetched = TRUE WHERE id = ANY(${poolIds})`;
+}
+
 export async function listIndexedPoolsForDex(dex: DexConfig, limit = 250): Promise<IndexedPool[]> {
   const sql = getDb();
   const safeLimit = Math.max(1, Math.min(1000, Math.trunc(limit)));

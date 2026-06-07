@@ -19,10 +19,15 @@ export const stablecoins: QuoteAsset[] = [
 ];
 
 // Wrapped native tokens — prices are derived from indexed stablecoin swaps at runtime.
+// NOTE: 0x0000...0000 = native ETH used by Uniswap V4 pools instead of WETH ERC-20.
+//       Its price is inherited from WETH after derivation (same asset, different address).
 export const wrappedNatives: QuoteAsset[] = [
   { chain: "base", address: "0x4200000000000000000000000000000000000006", symbol: "WETH", decimals: 18, usdPrice: 0 },
-  { chain: "eth", address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", symbol: "WETH", decimals: 18, usdPrice: 0 },
-  { chain: "bsc", address: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", symbol: "WBNB", decimals: 18, usdPrice: 0 },
+  { chain: "base", address: "0x0000000000000000000000000000000000000000", symbol: "ETH",  decimals: 18, usdPrice: 0 },
+  { chain: "eth",  address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", symbol: "WETH", decimals: 18, usdPrice: 0 },
+  { chain: "eth",  address: "0x0000000000000000000000000000000000000000", symbol: "ETH",  decimals: 18, usdPrice: 0 },
+  { chain: "bsc",  address: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", symbol: "WBNB", decimals: 18, usdPrice: 0 },
+  { chain: "bsc",  address: "0x0000000000000000000000000000000000000000", symbol: "BNB",  decimals: 18, usdPrice: 0 },
 ];
 
 export const quoteAssets: QuoteAsset[] = [...stablecoins, ...wrappedNatives];

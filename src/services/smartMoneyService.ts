@@ -188,17 +188,28 @@ async function getRecentSwapsFeed(hours: number, limit: number): Promise<SmFeedI
   return items;
 }
 
-export async function getSmartMoneyLeaderboard(limit = 20): Promise<SmLeaderEntry[]> {
+export async function getSmartMoneyLeaderboard(limit = 20, hours = 0): Promise<SmLeaderEntry[]> {
   const sql = getDb();
-  const rows = await sql`
-    SELECT address, score, total_trades, tokens_traded, total_volume_usd, chains_active,
-           win_rate_pct, realized_pnl_usd, early_entry_pct,
-           profitable_trades, total_closed_trades,
-           first_seen_at, last_seen_at
-    FROM smart_wallets
-    ORDER BY score DESC
-    LIMIT ${limit}
-  `;
+  const rows = hours > 0
+    ? await sql`
+        SELECT address, score, total_trades, tokens_traded, total_volume_usd, chains_active,
+               win_rate_pct, realized_pnl_usd, early_entry_pct,
+               profitable_trades, total_closed_trades,
+               first_seen_at, last_seen_at
+        FROM smart_wallets
+        WHERE last_seen_at >= NOW() - (${hours} * INTERVAL '1 hour')
+        ORDER BY score DESC
+        LIMIT ${limit}
+      `
+    : await sql`
+        SELECT address, score, total_trades, tokens_traded, total_volume_usd, chains_active,
+               win_rate_pct, realized_pnl_usd, early_entry_pct,
+               profitable_trades, total_closed_trades,
+               first_seen_at, last_seen_at
+        FROM smart_wallets
+        ORDER BY score DESC
+        LIMIT ${limit}
+      `;
 
   return rows.map((r, i) => ({
     rank: i + 1,
