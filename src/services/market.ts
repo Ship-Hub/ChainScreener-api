@@ -73,8 +73,11 @@ export async function listMarketTokens(
   chain?: ChainKey | "all",
   sort: TokenSortOrder = "volume",
   platform?: string,
+  limit?: number,
 ): Promise<TokenSummary[]> {
   const sql = getDb();
+  const finalLimit = Math.max(1, Math.min(200, Math.trunc(limit ?? (sort === "newest" ? 200 : 100))));
+  const queryLimit = sort === "newest" ? Math.min(400, Math.max(finalLimit * 2, finalLimit)) : finalLimit;
 
   const chainCondition = chain && chain !== "all"
     ? sql`AND chains."key" = ${chain}`
@@ -177,7 +180,7 @@ export async function listMarketTokens(
       ${chainCondition}
       ${platformCondition}
     ORDER BY ${orderBy}
-    LIMIT ${sort === "newest" ? 400 : 100}
+    LIMIT ${queryLimit}
   `;
 
   const currentBlocks = await getCurrentBlocksByChain();
@@ -189,7 +192,7 @@ export async function listMarketTokens(
     // block times (base=2s, bsc=3s, eth=12s) for accurate cross-chain ordering.
     // This corrects any residual ordering errors from the SQL timestamp approximation.
     mapped.sort((a, b) => a.ageMinutes - b.ageMinutes);
-    return mapped.slice(0, 200);
+    return mapped.slice(0, finalLimit);
   }
 
   return mapped;
