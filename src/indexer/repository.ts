@@ -173,17 +173,23 @@ export async function upsertDiscoveredPool(pool: DiscoveredPool) {
     baseToken = t0; quoteToken = t1;
   }
 
-  await sql`
-    INSERT INTO token_market_stats (
-      chain_id, token_address, quote_address,
-      price_usd, price_change_24h_pct, volume_24h_usd,
-      swaps_24h, buys_24h, sells_24h
-    ) VALUES (
-      ${chainId}, ${baseToken}, ${quoteToken},
-      0, 0, 0, 0, 0, 0
-    )
-    ON CONFLICT (chain_id, token_address) DO NOTHING
-  `;
+  // Non-fatal: if seeding fails for any reason (e.g. constraint), pool discovery
+  // must not be blocked — the aggregator will create a real row after the first swap.
+  try {
+    await sql`
+      INSERT INTO token_market_stats (
+        chain_id, token_address, quote_address,
+        price_usd, price_change_24h_pct, volume_24h_usd,
+        swaps_24h, buys_24h, sells_24h
+      ) VALUES (
+        ${chainId}, ${baseToken}, ${quoteToken},
+        0, 0, 0, 0, 0, 0
+      )
+      ON CONFLICT (chain_id, token_address) DO NOTHING
+    `;
+  } catch {
+    // Non-fatal — discovery continues without the placeholder row
+  }
 }
 
 /**

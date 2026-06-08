@@ -25,7 +25,7 @@ export async function fetchTokenMetadataOnce() {
   await sql`
     UPDATE tokens
     SET symbol = 'ETH', name = 'Ethereum', decimals = 18, updated_at = NOW()
-    WHERE address = ${ZERO_ADDRESS} AND symbol = 'UNKNOWN'
+    WHERE address = ${ZERO_ADDRESS} AND (symbol IS NULL OR symbol = 'UNKNOWN')
   `;
   await sql`
     UPDATE tokens
@@ -33,19 +33,20 @@ export async function fetchTokenMetadataOnce() {
     WHERE address IN (
       '0x4200000000000000000000000000000000000006',
       '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'
-    ) AND symbol = 'UNKNOWN'
+    ) AND (symbol IS NULL OR symbol = 'UNKNOWN')
   `;
   await sql`
     UPDATE tokens
     SET symbol = 'WBNB', name = 'Wrapped BNB', decimals = 18, updated_at = NOW()
-    WHERE address = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c' AND symbol = 'UNKNOWN'
+    WHERE address = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c' AND (symbol IS NULL OR symbol = 'UNKNOWN')
   `;
 
   const rows = await sql<UnresolvedToken[]>`
     SELECT chains."key" AS "chainKey", tokens.address
     FROM tokens
     JOIN chains ON chains.id = tokens.chain_id
-    WHERE tokens.symbol = 'UNKNOWN' AND tokens.address != ${ZERO_ADDRESS}
+    WHERE (tokens.symbol IS NULL OR tokens.symbol = 'UNKNOWN')
+      AND tokens.address != ${ZERO_ADDRESS}
     ORDER BY tokens.updated_at DESC
     LIMIT 500
   `;
