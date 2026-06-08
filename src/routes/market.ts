@@ -6,7 +6,7 @@ export async function registerMarketRoutes(app: FastifyInstance) {
   // Main token list — supports ?chain=base&sort=volume|gainers|losers
   app.get("/api/market/tokens", async (request, reply) => {
     try {
-      const query = request.query as { chain?: string; sort?: string };
+      const query = request.query as { chain?: string; sort?: string; minVolume?: string };
       if (query.chain && query.chain !== "all" && !isChainKey(query.chain))
         return reply.code(400).send({ error: "Invalid chain" });
 
@@ -18,7 +18,9 @@ export async function registerMarketRoutes(app: FastifyInstance) {
         ? query.sort
         : "volume") as TokenSortOrder;
 
-      return { data: await listMarketTokens(chain, sort) };
+      const minVolume = Math.max(0, Number(query.minVolume) || 0);
+
+      return { data: await listMarketTokens(chain, sort, undefined, undefined, 0, undefined, minVolume) };
     } catch (error) {
       return reply.code(503).send({
         error: "Market data is not available",

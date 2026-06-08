@@ -96,10 +96,6 @@ export async function listMarketTokens(
   const platformCondition = platform
     ? sql`AND tokens.launch_platform = ${platform}`
     : sql``;
-  const volumeCondition = minVolume > 0
-    ? sql`AND tms.volume_24h_usd >= ${minVolume}`
-    : sql``;
-
   // Age guard — applied inside the ordered CTE after pool_rollups JOIN so that
   // poolCreatedAt = COALESCE(block_timestamp, pool.created_at) is available.
   // Tokens without a pool row (poolCreatedAt IS NULL) are always included so
@@ -108,6 +104,14 @@ export async function listMarketTokens(
     ? sql`(pool_rollups."poolCreatedAt" IS NULL
            OR pool_rollups."poolCreatedAt" >= NOW() - (${maxAgeDays} * INTERVAL '1 day'))`
     : sql`TRUE`;
+
+  // Volume filter — only applies to tokens older than 1 hour so brand-new
+  // launches aren't hidden before they've had time to accrue volume.
+  const volumeCondition = minVolume > 0
+    ? sql`AND (candidate."volume24hUsd" >= ${minVolume}
+              OR pool_rollups."poolCreatedAt" IS NULL
+              OR pool_rollups."poolCreatedAt" >= NOW() - INTERVAL '1 hour')`
+    : sql``;
 
   const orderBy =
     sort === "gainers" ? sql`candidate."priceChange24h" DESC`
@@ -144,7 +148,6 @@ export async function listMarketTokens(
       WHERE TRUE
         ${chainCondition}
         ${platformCondition}
-        ${volumeCondition}
     ),
     pool_token_rows AS (
       SELECT
@@ -196,7 +199,7 @@ export async function listMarketTokens(
       LEFT JOIN pool_rollups
         ON pool_rollups.chain_id = candidate."chainId"
        AND pool_rollups.token_address = candidate.address
-      WHERE ${ageCondition}
+      WHERE ${ageCondition} ${volumeCondition}
       ORDER BY ${orderBy}
       LIMIT ${finalLimit}
       OFFSET ${sqlOffset}
