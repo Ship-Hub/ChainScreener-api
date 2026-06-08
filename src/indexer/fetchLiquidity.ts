@@ -204,22 +204,27 @@ export async function fetchLiquidityOnce(): Promise<{ updated: number }> {
       args: [poolManager as `0x${string}`] as const,
     }));
 
+    // Batch ERC20 balanceOf calls via multicall, chunked to stay within RPC limits.
+    // Without chunking, 300 V4 pools → 300+ token calls in a single multicall → RPC
+    // failure silently drops all V4 liquidity (the catch is non-fatal).
     const balanceByToken = new Map<string, bigint>();
-    if (calls.length > 0) {
+    for (let offset = 0; offset < calls.length; offset += MULTICALL_CHUNK) {
+      const chunk = calls.slice(offset, offset + MULTICALL_CHUNK);
+      const chunkTokens = erc20Tokens.slice(offset, offset + MULTICALL_CHUNK);
       try {
-        const results = (await client.multicall({ contracts: calls, allowFailure: true })) as {
+        const results = (await client.multicall({ contracts: chunk, allowFailure: true })) as {
           result?: bigint;
           error?: Error;
         }[];
-        for (let i = 0; i < erc20Tokens.length; i++) {
-          const addr = erc20Tokens[i];
+        for (let i = 0; i < chunkTokens.length; i++) {
+          const addr = chunkTokens[i];
           const result = results[i];
           if (addr && result?.result !== undefined) {
             balanceByToken.set(addr, result.result);
           }
         }
       } catch {
-        // Non-fatal
+        // Non-fatal — continue with next chunk
       }
     }
 

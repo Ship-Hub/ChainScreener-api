@@ -168,20 +168,59 @@ function priceRows(
   return { priced: [...stablePriced, ...nativePriced], derivedNativePrices };
 }
 
-function addEstimatedTimes(base: PricedSwapBase[]): PricedSwap[] {
-  const refByChain = new Map<ChainKey, { block: number; time: number }>();
-  for (const s of base) {
-    const cur = refByChain.get(s.chainKey);
-    if (!cur || s.blockNumber > cur.block) {
-      refByChain.set(s.chainKey, { block: s.blockNumber, time: s.observedAt.getTime() });
+/**
+ * Query the latest processed block per chain from the swap-ingestion cursor.
+ * Used to anchor swap timestamps to real wall-clock time, not DB insertion time.
+ * Falls back to an empty map (which triggers a per-batch fallback below).
+ */
+async function getCurrentBlocksByChain(): Promise<Map<ChainKey, number>> {
+  const sql = getDb();
+  try {
+    const rows = await sql`
+      SELECT chain_key, MAX(last_block::bigint) AS last_block
+      FROM indexer_cursors
+      WHERE worker_name = 'swap-ingestion'
+      GROUP BY chain_key
+    `;
+    const map = new Map<ChainKey, number>();
+    for (const row of rows) {
+      if (row.chain_key && row.last_block) {
+        map.set(row.chain_key as ChainKey, Number(row.last_block));
+      }
     }
+    return map;
+  } catch {
+    return new Map();
   }
+}
+
+/**
+ * Estimate real-world timestamps for each swap using block-number arithmetic.
+ *
+ * The old approach used `observedAt` (DB insertion time) of the latest swap as anchor.
+ * This was wrong for backfilled swaps: a swap indexed today that happened 7h ago would
+ * show `observedAt = now` and all estimated times would be compressed to the last few
+ * minutes.
+ *
+ * The fix: anchor to `Date.now()` + the current chain head from the swap-ingestion cursor.
+ * estimatedAt = now − (currentBlock − swapBlock) × blockTimeMs
+ * This is accurate for any swap regardless of when it was inserted into the DB.
+ */
+function addEstimatedTimes(base: PricedSwapBase[], currentBlocks: Map<ChainKey, number>): PricedSwap[] {
+  const now = Date.now();
+
+  // Fallback per chain: if cursor not in DB yet, use the max block from this batch
+  const batchMaxBlock = new Map<ChainKey, number>();
+  for (const s of base) {
+    const cur = batchMaxBlock.get(s.chainKey) ?? 0;
+    if (s.blockNumber > cur) batchMaxBlock.set(s.chainKey, s.blockNumber);
+  }
+
   return base.map((s) => {
-    const ref = refByChain.get(s.chainKey);
-    const maxBlock = ref?.block ?? s.blockNumber;
-    const refTime = ref?.time ?? Date.now();
+    const currentBlock = currentBlocks.get(s.chainKey) ?? batchMaxBlock.get(s.chainKey) ?? s.blockNumber;
     const blockTimeMs = BLOCK_TIME_MS[s.chainKey] ?? 6_000;
-    return { ...s, estimatedAt: new Date(refTime - (maxBlock - s.blockNumber) * blockTimeMs) };
+    const blocksAgo = Math.max(0, currentBlock - s.blockNumber);
+    return { ...s, estimatedAt: new Date(now - blocksAgo * blockTimeMs) };
   });
 }
 
@@ -339,13 +378,17 @@ export async function aggregateMarketOnce() {
   // our discovery window and not in our local swap index.
   const externalPrices = await fetchExternalNativePrices();
 
+  // Fetch current ingested block per chain — used by addEstimatedTimes so swap
+  // timestamps are anchored to real wall-clock time rather than DB insertion time.
+  const currentBlocks = await getCurrentBlocksByChain();
+
   // ── Step A: market stats from the most recent 10 000 swaps ───────────────
   const recentRows = await sql.unsafe<SwapRow[]>(
     `SELECT ${SWAP_SQL_COLS} ${SWAP_SQL_JOINS} ORDER BY swaps.block_number DESC, swaps.id DESC LIMIT 10000`,
   );
 
   const { priced: recentPriced, derivedNativePrices } = priceRows(recentRows, undefined, externalPrices);
-  const recentGrouped = groupByToken(addEstimatedTimes(recentPriced));
+  const recentGrouped = groupByToken(addEstimatedTimes(recentPriced, currentBlocks));
   for (const group of recentGrouped.values()) {
     await upsertMarketStats(group);
   }
@@ -374,7 +417,7 @@ export async function aggregateMarketOnce() {
   if (candleRows.length > 0) {
     // derivedNativePrices already has external fallback merged in (from Step A)
     const { priced: candlePricedBase } = priceRows(candleRows, derivedNativePrices);
-    const allPricedWithTime = addEstimatedTimes(candlePricedBase);
+    const allPricedWithTime = addEstimatedTimes(candlePricedBase, currentBlocks);
 
     // Batch insert into swap_prices
     const rows = allPricedWithTime.map((s) => ({

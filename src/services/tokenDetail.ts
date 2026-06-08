@@ -1,6 +1,13 @@
 import type { ChainKey } from "../config/chains.js";
 import { getDb } from "../db/postgres.js";
 
+// Average block times per chain — mirrors aggregateMarket.ts
+const BLOCK_TIME_MS: Partial<Record<ChainKey, number>> = {
+  base: 2_000,
+  eth:  12_000,
+  bsc:  3_000,
+};
+
 // Stablecoins are always worth ~$1 — their price never appears in token_market_stats
 // because that table tracks the *base* token, not the quote.
 const STABLECOIN_ADDRESSES = new Set([
@@ -170,6 +177,18 @@ export async function getTokenSwapHistory(chain: ChainKey, address: string, limi
   const safeLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
   const addr = address.toLowerCase();
 
+  // Fetch the latest ingested block for this chain so we can compute real swap times
+  // from block numbers.  The DB stores observed_at = insertion time (wrong for backfilled
+  // swaps), but block_number is always accurate.
+  const cursorRows = await sql`
+    SELECT MAX(last_block::bigint) AS last_block
+    FROM indexer_cursors
+    WHERE chain_key = ${chain} AND worker_name = 'swap-ingestion'
+  `;
+  const currentBlock = Number(cursorRows[0]?.last_block ?? 0);
+  const blockTimeMs = BLOCK_TIME_MS[chain] ?? 6_000;
+  const now = Date.now();
+
   const rows = await sql`
     SELECT
       chains."key"                                          AS chain,
@@ -222,7 +241,15 @@ export async function getTokenSwapHistory(chain: ChainKey, address: string, limi
     sender: (row.sender as string | null) ?? null,
     txHash: row.txHash as string,
     blockNumber: Number(row.blockNumber),
-    observedAt:
-      row.observedAt instanceof Date ? row.observedAt.toISOString() : String(row.observedAt),
+    // Estimate real-world time from block number so backfilled swaps show the correct
+    // age ("7h ago") instead of the DB insertion time ("55m ago").
+    observedAt: (() => {
+      const swapBlock = Number(row.blockNumber);
+      if (currentBlock > 0 && swapBlock > 0) {
+        const blocksAgo = Math.max(0, currentBlock - swapBlock);
+        return new Date(now - blocksAgo * blockTimeMs).toISOString();
+      }
+      return row.observedAt instanceof Date ? row.observedAt.toISOString() : String(row.observedAt);
+    })(),
   }));
 }
