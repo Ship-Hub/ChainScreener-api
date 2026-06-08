@@ -2,6 +2,13 @@ import type { ChainKey } from "../config/chains.js";
 import { getDb } from "../db/postgres.js";
 import type { Candle, TokenSummary } from "../types/token.js";
 
+// Average block times per chain (ms) — mirrors aggregateMarket.ts / tokenDetail.ts
+const BLOCK_TIME_MS: Partial<Record<ChainKey, number>> = {
+  base: 2_000,
+  eth:  12_000,
+  bsc:  3_000,
+};
+
 type MarketTokenRow = {
   chain: ChainKey;
   address: string;
@@ -19,12 +26,37 @@ type MarketTokenRow = {
   liquidityUsd: string;
   updatedAt: Date | string;
   dexName: string | null;
+  /** Set only when pools.block_timestamp has been backfilled; NULL otherwise. */
   poolCreatedAt: Date | string | null;
+  /** Always available — used for age estimation when poolCreatedAt is NULL. */
+  poolBlockNumber: string | number | null;
   candle1hNow: string | null;
   candle1hPrev: string | null;
   candle5mNow: string | null;
   candle5mPrev: string | null;
 };
+
+/** Return the highest ingested block per chain (from the swap-ingestion cursor). */
+async function getCurrentBlocksByChain(): Promise<Map<ChainKey, number>> {
+  const sql = getDb();
+  try {
+    const rows = await sql`
+      SELECT chain_key, MAX(last_block::bigint) AS last_block
+      FROM indexer_cursors
+      WHERE worker_name = 'swap-ingestion'
+      GROUP BY chain_key
+    `;
+    const map = new Map<ChainKey, number>();
+    for (const row of rows) {
+      if (row.chain_key && row.last_block) {
+        map.set(row.chain_key as ChainKey, Number(row.last_block));
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
 
 type CandleRow = {
   openedAt: Date | string;
@@ -86,11 +118,18 @@ export async function listMarketTokens(
       ) AS "dexName",
 
       (
-        SELECT MIN(COALESCE(p2.block_timestamp, p2.created_at))
+        SELECT MIN(p2.block_timestamp)
         FROM   pools p2
         WHERE  p2.chain_id = tms.chain_id
           AND  (p2.token0_address = tms.token_address OR p2.token1_address = tms.token_address)
       ) AS "poolCreatedAt",
+
+      (
+        SELECT MIN(p2.block_number)
+        FROM   pools p2
+        WHERE  p2.chain_id = tms.chain_id
+          AND  (p2.token0_address = tms.token_address OR p2.token1_address = tms.token_address)
+      ) AS "poolBlockNumber",
 
       (
         SELECT close_usd FROM token_candles_1h
@@ -134,7 +173,9 @@ export async function listMarketTokens(
     LIMIT 50
   `;
 
-  return rows.map(marketRowToTokenSummary);
+  const currentBlocks = await getCurrentBlocksByChain();
+  const now = Date.now();
+  return rows.map((row) => marketRowToTokenSummary(row, currentBlocks, now));
 }
 
 export async function getMarketCandles(chain: ChainKey, address: string, interval = "5m"): Promise<Candle[]> {
@@ -203,7 +244,11 @@ function candlePctChange(now: string | null, prev: string | null): number | null
   return ((n - p) / p) * 100;
 }
 
-function marketRowToTokenSummary(row: MarketTokenRow): TokenSummary {
+function marketRowToTokenSummary(
+  row: MarketTokenRow,
+  currentBlocks: Map<ChainKey, number>,
+  now: number,
+): TokenSummary {
   const addressTail    = row.address.slice(-4).toUpperCase();
   const priceChange24h = Number(row.priceChange24h);
   const volume24hUsd   = Number(row.volume24hUsd);
@@ -216,11 +261,27 @@ function marketRowToTokenSummary(row: MarketTokenRow): TokenSummary {
   const poolCreatedAt = row.poolCreatedAt
     ? (row.poolCreatedAt instanceof Date ? row.poolCreatedAt : new Date(row.poolCreatedAt as string))
     : null;
+  const poolBlockNumber = row.poolBlockNumber ? Number(row.poolBlockNumber) : null;
   const updatedAt = row.updatedAt instanceof Date ? row.updatedAt : new Date(row.updatedAt as string);
 
-  const ageMinutes: number = poolCreatedAt
-    ? Math.max(1, Math.round((Date.now() - poolCreatedAt.getTime()) / 60_000))
-    : Math.max(1, Math.round((Date.now() - updatedAt.getTime()) / 60_000));
+  // Compute age: prefer on-chain block_timestamp; fall back to block-number estimation
+  // (uses cursor block so it's immediately accurate without waiting for the slow backfill);
+  // last resort is the DB insertion time stored in updated_at.
+  let ageMinutes: number;
+  if (poolCreatedAt) {
+    ageMinutes = Math.max(1, Math.round((now - poolCreatedAt.getTime()) / 60_000));
+  } else if (poolBlockNumber) {
+    const currentBlock = currentBlocks.get(row.chain) ?? 0;
+    if (currentBlock > 0) {
+      const blockTimeMs = BLOCK_TIME_MS[row.chain] ?? 6_000;
+      const blocksAgo = Math.max(0, currentBlock - poolBlockNumber);
+      ageMinutes = Math.max(1, Math.round((blocksAgo * blockTimeMs) / 60_000));
+    } else {
+      ageMinutes = Math.max(1, Math.round((now - updatedAt.getTime()) / 60_000));
+    }
+  } else {
+    ageMinutes = Math.max(1, Math.round((now - updatedAt.getTime()) / 60_000));
+  }
 
   const ageHours = ageMinutes / 60;
 

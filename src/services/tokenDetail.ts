@@ -76,6 +76,18 @@ export type TokenSwap = {
 
 export async function getTokenDetail(chain: ChainKey, address: string): Promise<TokenDetail | null> {
   const sql = getDb();
+
+  // Fetch current ingested block for this chain so we can estimate pool age from
+  // block_number when block_timestamp hasn't been backfilled yet.
+  const cursorRows = await sql`
+    SELECT MAX(last_block::bigint) AS last_block
+    FROM indexer_cursors
+    WHERE chain_key = ${chain} AND worker_name = 'swap-ingestion'
+  `;
+  const currentBlock = Number(cursorRows[0]?.last_block ?? 0);
+  const blockTimeMs = BLOCK_TIME_MS[chain] ?? 6_000;
+  const now = Date.now();
+
   const rows = await sql`
     SELECT
       chains."key"                          AS chain,
@@ -101,10 +113,15 @@ export async function getTokenDetail(chain: ChainKey, address: string): Promise<
         ORDER BY p.created_at DESC LIMIT 1
       ) AS "dexName",
       (
-        SELECT MIN(COALESCE(p2.block_timestamp, p2.created_at)) FROM pools p2
+        SELECT MIN(p2.block_timestamp) FROM pools p2
         WHERE p2.chain_id = tms.chain_id
           AND (p2.token0_address = tms.token_address OR p2.token1_address = tms.token_address)
-      ) AS "poolCreatedAt"
+      ) AS "poolCreatedAt",
+      (
+        SELECT MIN(p2.block_number) FROM pools p2
+        WHERE p2.chain_id = tms.chain_id
+          AND (p2.token0_address = tms.token_address OR p2.token1_address = tms.token_address)
+      ) AS "poolBlockNumber"
     FROM token_market_stats tms
     JOIN chains ON chains.id = tms.chain_id
     LEFT JOIN tokens t ON t.chain_id = tms.chain_id AND t.address = tms.token_address
@@ -128,14 +145,24 @@ export async function getTokenDetail(chain: ChainKey, address: string): Promise<
     }
   }
 
-  // Compute age from pool creation date (same logic as market service)
+  // Compute age from pool creation time, with fallback to block-number estimation.
+  // block_timestamp is NULL for pools discovered before the feature was added;
+  // in that case we estimate from block_number + cursor block (immediate, no backfill needed).
   const updatedAt = row.lastActivityAt instanceof Date ? row.lastActivityAt : new Date(String(row.lastActivityAt));
   const poolCreatedAt = row.poolCreatedAt
     ? (row.poolCreatedAt instanceof Date ? row.poolCreatedAt : new Date(String(row.poolCreatedAt)))
     : null;
-  const ageMinutes = poolCreatedAt
-    ? Math.max(1, Math.round((Date.now() - poolCreatedAt.getTime()) / 60_000))
-    : Math.max(1, Math.round((Date.now() - updatedAt.getTime()) / 60_000));
+  const poolBlockNumber = row.poolBlockNumber ? Number(row.poolBlockNumber) : null;
+
+  let ageMinutes: number;
+  if (poolCreatedAt) {
+    ageMinutes = Math.max(1, Math.round((now - poolCreatedAt.getTime()) / 60_000));
+  } else if (poolBlockNumber && currentBlock > 0) {
+    const blocksAgo = Math.max(0, currentBlock - poolBlockNumber);
+    ageMinutes = Math.max(1, Math.round((blocksAgo * blockTimeMs) / 60_000));
+  } else {
+    ageMinutes = Math.max(1, Math.round((now - updatedAt.getTime()) / 60_000));
+  }
   const ageHours = ageMinutes / 60;
 
   // Risk scoring (matches market service logic)
