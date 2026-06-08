@@ -6,29 +6,25 @@ services:
     ports:
       - "4000:4000"
     depends_on:
-      - mysql
-      - redis
+      postgres:
+        condition: service_healthy
 
-  mysql:
-    image: mysql:8.4
+  postgres:
+    image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      MYSQL_DATABASE: chain_screener
-      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      POSTGRES_USER: chain
+      POSTGRES_PASSWORD: chain
+      POSTGRES_DB: chain_screener
     ports:
-      - "3306:3306"
+      - "5432:5432"
     volumes:
-      - chain_screener_mysql:/var/lib/mysql
-      - ./db/schema.mysql.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
-
-  redis:
-    image: redis:7-alpine
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-    volumes:
-      - chain_screener_redis:/data
+      - chain_screener_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chain -d chain_screener"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
-  chain_screener_mysql:
-  chain_screener_redis:
+  chain_screener_pgdata:

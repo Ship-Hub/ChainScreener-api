@@ -133,6 +133,7 @@ CREATE INDEX IF NOT EXISTS idx_swaps_pool_block      ON swaps (pool_id, block_nu
 CREATE INDEX IF NOT EXISTS idx_swaps_chain_block     ON swaps (chain_id, block_number);
 CREATE INDEX IF NOT EXISTS idx_swaps_sender_block    ON swaps (sender_address, block_number);
 CREATE INDEX IF NOT EXISTS idx_swaps_recipient_block ON swaps (recipient_address, block_number);
+CREATE INDEX IF NOT EXISTS idx_swaps_block_id        ON swaps (block_number DESC, id DESC);
 
 -- ─── Token market stats ───────────────────────────────────────────────────────
 

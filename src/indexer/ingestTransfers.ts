@@ -33,10 +33,14 @@ export async function ingestTransfersOnce() {
     byChain.set(token.chainKey, [...(byChain.get(token.chainKey) ?? []), token]);
   }
 
-  const results = [];
-  for (const [chainKey, chainTokens] of byChain.entries()) {
-    results.push(await ingestChainTransfers(chainKey, chainTokens));
-  }
+  const results = await Promise.all(
+    [...byChain.entries()].map(([chainKey, chainTokens]) =>
+      ingestChainTransfers(chainKey, chainTokens).catch((err) => {
+        console.warn(`[ingestTransfers] ${chainKey} failed: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`);
+        return { chainKey, fromBlock: 0n, toBlock: 0n, transfers: 0 };
+      }),
+    ),
+  );
 
   return results;
 }
@@ -66,84 +70,135 @@ async function ingestChainTransfers(chainKey: ChainKey, tokens: ActiveToken[]) {
   });
 
   const tokenByAddress = new Map(tokens.map((token) => [token.tokenAddress.toLowerCase(), token]));
-  let transfers = 0;
 
+  // Collect data in memory for batch SQL operations
+  const transferRows: Array<{
+    chain_id: number;
+    token_address: string;
+    from_address: string;
+    to_address: string;
+    amount_raw: string;
+    block_number: string;
+    tx_hash: string;
+    log_index: number;
+    raw_log: string;
+  }> = [];
+
+  const balanceDeltas = new Map<string, { delta: bigint; block: bigint }>();
+  const fundingEdges = new Map<string, { amount: bigint; firstBlock: bigint; lastBlock: bigint; count: number }>();
+
+  let transfers = 0;
   for (const log of logs) {
     const token = tokenByAddress.get(log.address.toLowerCase());
     if (!token || !log.args.from || !log.args.to || log.args.value === undefined) continue;
 
     const from = log.args.from.toLowerCase();
     const to = log.args.to.toLowerCase();
-    const amount = log.args.value.toString();
-    const rawLogJson = JSON.stringify(log, (_key, value) => (typeof value === "bigint" ? value.toString() : value));
+    const amount = log.args.value;
+    const chainId = Number(token.chainId);
+    const tokenAddr = log.address.toLowerCase();
 
-    await sql`
-      INSERT INTO token_transfers (
-        chain_id, token_address, from_address, to_address, amount_raw,
-        block_number, tx_hash, log_index, raw_log
-      )
-      VALUES (
-        ${Number(token.chainId)}, ${log.address.toLowerCase()},
-        ${from}, ${to}, ${amount},
-        ${log.blockNumber.toString()}, ${log.transactionHash},
-        ${Number(log.logIndex)}, ${rawLogJson}
-      )
-      ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING
-    `;
+    transferRows.push({
+      chain_id: chainId,
+      token_address: tokenAddr,
+      from_address: from,
+      to_address: to,
+      amount_raw: amount.toString(),
+      block_number: log.blockNumber.toString(),
+      tx_hash: log.transactionHash,
+      log_index: Number(log.logIndex),
+      raw_log: JSON.stringify(log, (_k, v) => (typeof v === "bigint" ? v.toString() : v)),
+    });
 
-    if (from !== zeroAddress) await applyBalanceDelta(Number(token.chainId), log.address, from, -log.args.value, log.blockNumber);
-    if (to !== zeroAddress) await applyBalanceDelta(Number(token.chainId), log.address, to, log.args.value, log.blockNumber);
+    if (from !== zeroAddress) {
+      const k = `${chainId}:${tokenAddr}:${from}`;
+      const e = balanceDeltas.get(k) ?? { delta: 0n, block: 0n };
+      balanceDeltas.set(k, { delta: e.delta - amount, block: e.block > log.blockNumber ? e.block : log.blockNumber });
+    }
+    if (to !== zeroAddress) {
+      const k = `${chainId}:${tokenAddr}:${to}`;
+      const e = balanceDeltas.get(k) ?? { delta: 0n, block: 0n };
+      balanceDeltas.set(k, { delta: e.delta + amount, block: e.block > log.blockNumber ? e.block : log.blockNumber });
+    }
     if (from !== zeroAddress && to !== zeroAddress) {
-      await upsertFundingEdge(Number(token.chainId), log.address, from, to, amount, log.blockNumber);
+      const k = `${chainId}:${tokenAddr}:${from}:${to}`;
+      const e = fundingEdges.get(k);
+      if (e) {
+        e.amount += amount;
+        e.lastBlock = e.lastBlock > log.blockNumber ? e.lastBlock : log.blockNumber;
+        e.count += 1;
+      } else {
+        fundingEdges.set(k, { amount, firstBlock: log.blockNumber, lastBlock: log.blockNumber, count: 1 });
+      }
     }
     transfers += 1;
+  }
+
+  // Batch 1: INSERT token_transfers
+  if (transferRows.length > 0) {
+    const BATCH_SIZE = 500;
+    for (let i = 0; i < transferRows.length; i += BATCH_SIZE) {
+      await sql`INSERT INTO token_transfers ${sql(transferRows.slice(i, i + BATCH_SIZE))} ON CONFLICT DO NOTHING`;
+    }
+  }
+
+  // Batch 2: UPSERT holder_balances
+  if (balanceDeltas.size > 0) {
+    const BATCH_SIZE = 500;
+    const rows = [...balanceDeltas.entries()].map(([key, { delta, block }]) => {
+      const [chainId, tokenAddr, walletAddr] = key.split(':');
+      return {
+        chain_id: Number(chainId),
+        token_address: tokenAddr,
+        wallet_address: walletAddr,
+        balance_raw: delta.toString(),
+        last_activity_block: Number(block),
+      };
+    });
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      const chunk = rows.slice(i, i + BATCH_SIZE);
+      await sql`
+        INSERT INTO holder_balances ${sql(chunk)}
+        ON CONFLICT (chain_id, token_address, wallet_address) DO UPDATE
+          SET balance_raw = (CAST(holder_balances.balance_raw AS NUMERIC) + CAST(EXCLUDED.balance_raw AS NUMERIC))::TEXT,
+              last_activity_block = GREATEST(holder_balances.last_activity_block, EXCLUDED.last_activity_block::BIGINT)
+      `;
+    }
+  }
+
+  // Batch 3: UPSERT wallet_funding_edges
+  if (fundingEdges.size > 0) {
+    const BATCH_SIZE = 500;
+    const rows = [...fundingEdges.entries()].map(([key, { amount, firstBlock, lastBlock, count }]) => {
+      const [chainId, tokenAddr, from, to] = key.split(':');
+      return {
+        chain_id: Number(chainId),
+        from_address: from,
+        to_address: to,
+        token_address: tokenAddr,
+        amount_raw: amount.toString(),
+        first_seen_block: Number(firstBlock),
+        last_seen_block: Number(lastBlock),
+        transfer_count: count,
+        confidence: count * 0.05,
+      };
+    });
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      const chunk = rows.slice(i, i + BATCH_SIZE);
+      await sql`
+        INSERT INTO wallet_funding_edges ${sql(chunk)}
+        ON CONFLICT (chain_id, from_address, to_address, token_address) DO UPDATE
+          SET amount_raw = (CAST(wallet_funding_edges.amount_raw AS NUMERIC) + CAST(EXCLUDED.amount_raw AS NUMERIC))::TEXT,
+              last_seen_block = GREATEST(wallet_funding_edges.last_seen_block, EXCLUDED.last_seen_block::BIGINT),
+              transfer_count = wallet_funding_edges.transfer_count + EXCLUDED.transfer_count,
+              confidence = LEAST(0.95, wallet_funding_edges.confidence + EXCLUDED.confidence)
+      `;
+    }
   }
 
   await snapshotHolders(tokens.map((token) => ({ chainId: Number(token.chainId), tokenAddress: token.tokenAddress })));
   await setCursor(chainKey, "_transfers", workerName, toBlock);
   return { chainKey, fromBlock, toBlock, transfers };
-}
-
-async function applyBalanceDelta(
-  chainId: number,
-  tokenAddress: string,
-  walletAddress: string,
-  delta: bigint,
-  blockNumber: bigint,
-) {
-  const sql = getDb();
-  // PostgreSQL doesn't have MySQL's DECIMAL arithmetic on varchar — store as numeric string.
-  // We do a read-modify-write here for correctness (BIGINT arithmetic on text is risky at scale).
-  await sql`
-    INSERT INTO holder_balances (chain_id, token_address, wallet_address, balance_raw, last_activity_block)
-    VALUES (${chainId}, ${tokenAddress.toLowerCase()}, ${walletAddress.toLowerCase()}, ${delta.toString()}, ${blockNumber.toString()})
-    ON CONFLICT (chain_id, token_address, wallet_address) DO UPDATE
-      SET balance_raw = (CAST(holder_balances.balance_raw AS NUMERIC) + ${delta.toString()}::NUMERIC)::TEXT,
-          last_activity_block = GREATEST(holder_balances.last_activity_block, ${blockNumber.toString()}::BIGINT)
-  `;
-}
-
-async function upsertFundingEdge(
-  chainId: number,
-  tokenAddress: string,
-  from: string,
-  to: string,
-  amount: string,
-  blockNumber: bigint,
-) {
-  const sql = getDb();
-  await sql`
-    INSERT INTO wallet_funding_edges (
-      chain_id, from_address, to_address, token_address,
-      amount_raw, first_seen_block, last_seen_block, transfer_count, confidence
-    )
-    VALUES (${chainId}, ${from}, ${to}, ${tokenAddress.toLowerCase()}, ${amount}, ${blockNumber.toString()}, ${blockNumber.toString()}, 1, 0.55)
-    ON CONFLICT (chain_id, from_address, to_address, token_address) DO UPDATE
-      SET amount_raw      = (CAST(wallet_funding_edges.amount_raw AS NUMERIC) + ${amount}::NUMERIC)::TEXT,
-          last_seen_block = GREATEST(wallet_funding_edges.last_seen_block, ${blockNumber.toString()}::BIGINT),
-          transfer_count  = wallet_funding_edges.transfer_count + 1,
-          confidence      = LEAST(0.95, wallet_funding_edges.confidence + 0.05)
-  `;
 }
 
 async function snapshotHolders(tokens: Array<{ chainId: number; tokenAddress: string }>) {

@@ -58,10 +58,15 @@ export async function fetchTokenMetadataOnce() {
     byChain.set(row.chainKey, list);
   }
 
-  let updated = 0;
-  for (const [chain, addresses] of byChain.entries()) {
-    updated += await fetchChainMetadata(chain, addresses);
-  }
+  const results = await Promise.all(
+    [...byChain.entries()].map(([chain, addresses]) =>
+      fetchChainMetadata(chain, addresses).catch((err) => {
+        console.warn(`[fetchTokenMetadata] ${chain} failed: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`);
+        return 0;
+      }),
+    ),
+  );
+  const updated = results.reduce((sum, n) => sum + n, 0);
 
   return { checked: rows.length, updated };
 }

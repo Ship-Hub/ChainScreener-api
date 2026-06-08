@@ -56,7 +56,7 @@ export type TokenDetail = {
 export type TokenSwap = {
   chain: ChainKey;
   dexName: string;
-  protocolVersion: string;
+  protocolVersion: "v2" | "v3" | "v4";
   poolAddress: string | null;
   token0: string;
   token1: string;
@@ -253,7 +253,7 @@ export async function getTokenSwapHistory(chain: ChainKey, address: string, limi
   return rows.map((row) => ({
     chain: row.chain as ChainKey,
     dexName: row.dexName as string,
-    protocolVersion: row.protocolVersion as string,
+    protocolVersion: row.protocolVersion as "v2" | "v3" | "v4",
     poolAddress: (row.poolAddress as string | null) ?? null,
     token0: row.token0 as string,
     token1: row.token1 as string,

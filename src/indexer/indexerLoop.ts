@@ -103,6 +103,7 @@ export async function startIndexerLoop(log?: (msg: string) => void) {
 
     const elapsed = Math.round((Date.now() - cycleStart) / 1000);
     const sleep = Math.max(1, env.INDEXER_POLL_INTERVAL_SECS - elapsed);
+    info(`[indexer] cycle completed in ${elapsed}s — next in ${sleep}s`);
     await new Promise((resolve) => setTimeout(resolve, sleep * 1000));
   }
 }

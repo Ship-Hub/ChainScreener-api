@@ -10,7 +10,7 @@ export async function registerLaunchRoutes(app: FastifyInstance) {
   app.get("/api/launches", async (request) => {
     const query = request.query as {
       chain?: string; sort?: string; platform?: string;
-      limit?: string; offset?: string; maxAgeDays?: string;
+      limit?: string; offset?: string; maxAgeDays?: string; minVolume?: string;
     };
     const chain       = query.chain && isChainKey(query.chain) ? query.chain : "all";
     const sort        = query.sort === "gainers" ? "gainers" : query.sort === "volume" ? "volume" : "newest";
@@ -19,8 +19,10 @@ export async function registerLaunchRoutes(app: FastifyInstance) {
     const offset      = Math.max(0, Number(query.offset) || 0);
     // Default 7-day window for the Launches page; callers can override or pass 0 for no cap.
     const maxAgeDays  = query.maxAgeDays !== undefined ? Number(query.maxAgeDays) || 0 : 7;
+    // Minimum volume in USD to filter out noise tokens (< $10 by default)
+    const minVolume   = Math.max(0, Number(query.minVolume) || 0);
 
-    const tokens = await listMarketTokens(chain, sort, platform, limit, offset, maxAgeDays || undefined);
+    const tokens = await listMarketTokens(chain, sort, platform, limit, offset, maxAgeDays || undefined, minVolume);
     return {
       data:    tokens,
       offset,

@@ -34,6 +34,8 @@ type MarketTokenRow = {
   candle1hPrev: string | null;
   candle5mNow: string | null;
   candle5mPrev: string | null;
+  volume5mNow: string | null;
+  volume1hNow: string | null;
 };
 
 /** Return the highest ingested block per chain (from the swap-ingestion cursor). */
@@ -81,6 +83,8 @@ export async function listMarketTokens(
    * Prevents the launches list from surfacing months-old tokens on later pages.
    */
   maxAgeDays?: number,
+  /** Minimum 24h volume in USD to filter out noise tokens. 0 = no filter. */
+  minVolume = 0,
 ): Promise<TokenSummary[]> {
   const sql = getDb();
   const finalLimit = Math.max(1, Math.min(500, Math.trunc(limit ?? 100)));
@@ -91,6 +95,9 @@ export async function listMarketTokens(
     : sql``;
   const platformCondition = platform
     ? sql`AND tokens.launch_platform = ${platform}`
+    : sql``;
+  const volumeCondition = minVolume > 0
+    ? sql`AND tms.volume_24h_usd >= ${minVolume}`
     : sql``;
 
   // Age guard — applied inside the ordered CTE after pool_rollups JOIN so that
@@ -137,6 +144,7 @@ export async function listMarketTokens(
       WHERE TRUE
         ${chainCondition}
         ${platformCondition}
+        ${volumeCondition}
     ),
     pool_token_rows AS (
       SELECT
@@ -241,7 +249,22 @@ export async function listMarketTokens(
           AND  token_address = ordered.address
         ORDER  BY bucket DESC
         LIMIT  1 OFFSET 1
-      ) AS "candle5mPrev"
+      ) AS "candle5mPrev",
+
+      (
+        SELECT volume_usd FROM token_candles_5m
+        WHERE  chain_id      = ordered."chainId"
+          AND  token_address = ordered.address
+          AND  bucket >= NOW() - INTERVAL '5 minutes'
+        LIMIT  1
+      ) AS "volume5mNow",
+      (
+        SELECT volume_usd FROM token_candles_1h
+        WHERE  chain_id      = ordered."chainId"
+          AND  token_address = ordered.address
+          AND  bucket >= NOW() - INTERVAL '1 hour'
+        LIMIT  1
+      ) AS "volume1hNow"
     FROM ordered
   `;
 
@@ -396,8 +419,8 @@ function marketRowToTokenSummary(
     marketCapUsd,
     fdvUsd:       0,
     liquidityUsd: Number(row.liquidityUsd) || 0,
-    volume5mUsd:  volume24hUsd / 288,
-    volume1hUsd:  volume24hUsd / 24,
+    volume5mUsd:  Number(row.volume5mNow) || volume24hUsd / 288,
+    volume1hUsd:  Number(row.volume1hNow) || volume24hUsd / 24,
     volume24hUsd,
     buys:          Number(row.buys24h),
     sells:         Number(row.sells24h),

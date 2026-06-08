@@ -15,6 +15,8 @@ type SwapRow = {
   blockNumber: number | string;
   txHash: string;
   observedAt: Date | string;
+  token0Decimals: number | null;
+  token1Decimals: number | null;
 };
 
 type PricedSwapBase = {
@@ -124,13 +126,17 @@ const SWAP_SQL_COLS = `
   swaps.protocol_version AS "protocolVersion",
   swaps.block_number AS "blockNumber",
   swaps.tx_hash      AS "txHash",
-  swaps.observed_at  AS "observedAt"
+  swaps.observed_at  AS "observedAt",
+  t0.decimals AS "token0Decimals",
+  t1.decimals AS "token1Decimals"
 `;
 
 const SWAP_SQL_JOINS = `
   FROM swaps
   JOIN chains ON chains.id = swaps.chain_id
   LEFT JOIN pools ON pools.id = swaps.pool_id
+  LEFT JOIN tokens t0 ON t0.chain_id = swaps.chain_id AND t0.address = pools.token0_address
+  LEFT JOIN tokens t1 ON t1.chain_id = swaps.chain_id AND t1.address = pools.token1_address
   WHERE pools.token0_address IS NOT NULL
     AND pools.token1_address IS NOT NULL
 `;
@@ -400,6 +406,32 @@ export async function aggregateMarketOnce() {
   // WETH → USD conversion without a separate RPC call.
   await upsertNativeAssetPrices(derivedNativePrices);
 
+  // ── Step A2: recover stale tokens (zero volume/price) ─────────────────────
+  // Tokens whose swaps fall outside the top 10K window never get aggregated.
+  // This pass explicitly processes their swaps so they appear with real data.
+  const staleTokens = await sql<{ chainId: number; tokenAddress: string }[]>`
+    SELECT chain_id AS "chainId", token_address AS "tokenAddress"
+    FROM token_market_stats
+    WHERE volume_24h_usd = 0 AND price_usd = 0
+    LIMIT 20
+  `;
+  for (const token of staleTokens) {
+    const tokenSwaps = await sql<SwapRow[]>`
+      SELECT ${sql.unsafe(SWAP_SQL_COLS)} ${sql.unsafe(SWAP_SQL_JOINS)}
+      AND swaps.chain_id = ${token.chainId}
+      AND (pools.token0_address = ${token.tokenAddress} OR pools.token1_address = ${token.tokenAddress})
+      ORDER BY swaps.block_number DESC, swaps.id DESC
+      LIMIT 500
+    `;
+    if (tokenSwaps.length === 0) continue;
+    const { priced } = priceRows(tokenSwaps, derivedNativePrices, externalPrices);
+    if (priced.length === 0) continue;
+    const grouped = groupByToken(addEstimatedTimes(priced, currentBlocks));
+    for (const group of grouped.values()) {
+      await upsertMarketStats(group);
+    }
+  }
+
   // ── Step B: incremental swap_prices insert ────────────────────────────────
   const lastSwapId = await getCandleAggCursor();
 
@@ -489,7 +521,10 @@ function priceSwapWith(row: SwapRow, assets: QuoteAsset[]): PricedSwapBase | und
   const quoteRaw      = quoteIsToken0 ? row.amount0Raw : row.amount1Raw;
   const tokenRaw      = quoteIsToken0 ? row.amount1Raw : row.amount0Raw;
   const quoteAmount   = normalizeAmount(absBigInt(quoteRaw), quote.decimals);
-  const tokenAmount   = normalizeAmount(absBigInt(tokenRaw), 18); // assumes 18 decimals for unknown tokens
+  const tokenDecimals = quoteIsToken0
+    ? (row.token1Decimals ?? 18)
+    : (row.token0Decimals ?? 18);
+  const tokenAmount   = normalizeAmount(absBigInt(tokenRaw), Number(tokenDecimals));
   if (quoteAmount <= 0 || tokenAmount <= 0) return undefined;
 
   const observedAt = row.observedAt instanceof Date ? row.observedAt : new Date(row.observedAt as string);
@@ -503,7 +538,7 @@ function priceSwapWith(row: SwapRow, assets: QuoteAsset[]): PricedSwapBase | und
   const quoteRawBig = BigInt(quoteRaw);
   const isBuy = isV3orV4
     ? (quoteIsToken0 ? quoteRawBig > 0n : quoteRawBig < 0n)   // V3/V4: positive = into pool
-    : (quoteIsToken0 ? quoteRawBig < 0n : quoteRawBig > 0n);  // V2: negative = into pool (out - in)
+    : quoteRawBig < 0n;  // V2: negative into pool always means buy of base token
 
   const priceUsd  = (quoteAmount * quote.usdPrice) / tokenAmount;
   const volumeUsd = quoteAmount * quote.usdPrice;

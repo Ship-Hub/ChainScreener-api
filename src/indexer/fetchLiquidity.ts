@@ -44,6 +44,155 @@ function normalizeBalance(raw: bigint, decimals: number): number {
   return Number(whole) + frac;
 }
 
+function groupByChain(rows: PoolRow[]): Map<ChainKey, PoolRow[]> {
+  const byChain = new Map<ChainKey, PoolRow[]>();
+  for (const row of rows) {
+    const arr = byChain.get(row.chainKey) ?? [];
+    arr.push(row);
+    byChain.set(row.chainKey, arr);
+  }
+  return byChain;
+}
+
+async function processV2V3Chain(
+  chainKey: ChainKey,
+  chainPools: PoolRow[],
+  getPrice: (chainId: number, chainKey: ChainKey, address: string) => number,
+): Promise<Map<string, number>> {
+  const client = getRpcClient(chainKey);
+  const tvlByToken = new Map<string, number>();
+
+  const allCalls = chainPools.flatMap((pool) => [
+    {
+      address: pool.token0 as `0x${string}`,
+      abi: ERC20_BALANCE_ABI,
+      functionName: "balanceOf" as const,
+      args: [pool.poolAddress as `0x${string}`] as const,
+    },
+    {
+      address: pool.token1 as `0x${string}`,
+      abi: ERC20_BALANCE_ABI,
+      functionName: "balanceOf" as const,
+      args: [pool.poolAddress as `0x${string}`] as const,
+    },
+  ]);
+
+  for (let offset = 0; offset < allCalls.length; offset += MULTICALL_CHUNK) {
+    const chunk = allCalls.slice(offset, offset + MULTICALL_CHUNK);
+    const chunkPools = chainPools.slice(offset / 2, (offset + MULTICALL_CHUNK) / 2);
+
+    let results: { result?: bigint; error?: Error }[] = [];
+    try {
+      results = (await client.multicall({
+        contracts: chunk,
+        allowFailure: true,
+      })) as { result?: bigint; error?: Error }[];
+    } catch {
+      continue;
+    }
+
+    for (let i = 0; i < chunkPools.length; i++) {
+      const pool = chunkPools[i];
+      if (!pool) continue;
+      const r0 = results[i * 2];
+      const r1 = results[i * 2 + 1];
+      if (!r0 || !r1) continue;
+
+      const bal0 = r0.result !== undefined ? normalizeBalance(r0.result, Number(pool.decimals0)) : 0;
+      const bal1 = r1.result !== undefined ? normalizeBalance(r1.result, Number(pool.decimals1)) : 0;
+      const p0 = getPrice(Number(pool.chainId), chainKey, pool.token0);
+      const p1 = getPrice(Number(pool.chainId), chainKey, pool.token1);
+
+      const tvl = bal0 * p0 + bal1 * p1;
+      if (tvl <= 0) continue;
+
+      for (const addr of [pool.token0, pool.token1]) {
+        const key = `${Number(pool.chainId)}:${addr.toLowerCase()}`;
+        tvlByToken.set(key, (tvlByToken.get(key) ?? 0) + tvl);
+      }
+    }
+  }
+
+  return tvlByToken;
+}
+
+async function processV4Chain(
+  chainKey: ChainKey,
+  chainPools: PoolRow[],
+  getPrice: (chainId: number, chainKey: ChainKey, address: string) => number,
+): Promise<Map<string, number>> {
+  const poolManager = V4_POOL_MANAGER[chainKey];
+  if (!poolManager) return new Map();
+  const client = getRpcClient(chainKey);
+  const tvlByToken = new Map<string, number>();
+
+  const tokenSet = new Set<string>();
+  for (const pool of chainPools) {
+    tokenSet.add(pool.token0.toLowerCase());
+    tokenSet.add(pool.token1.toLowerCase());
+  }
+  const erc20Tokens = [...tokenSet].filter((t) => t !== NATIVE_ETH);
+
+  const calls = erc20Tokens.map((t) => ({
+    address: t as `0x${string}`,
+    abi: ERC20_BALANCE_ABI,
+    functionName: "balanceOf" as const,
+    args: [poolManager as `0x${string}`] as const,
+  }));
+
+  const balanceByToken = new Map<string, bigint>();
+  for (let offset = 0; offset < calls.length; offset += MULTICALL_CHUNK) {
+    const chunk = calls.slice(offset, offset + MULTICALL_CHUNK);
+    const chunkTokens = erc20Tokens.slice(offset, offset + MULTICALL_CHUNK);
+    try {
+      const results = (await client.multicall({ contracts: chunk, allowFailure: true })) as {
+        result?: bigint;
+        error?: Error;
+      }[];
+      for (let i = 0; i < chunkTokens.length; i++) {
+        const addr = chunkTokens[i];
+        const result = results[i];
+        if (addr && result?.result !== undefined) {
+          balanceByToken.set(addr, result.result);
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  if (tokenSet.has(NATIVE_ETH)) {
+    try {
+      const ethBal = await client.getBalance({ address: poolManager as `0x${string}` });
+      balanceByToken.set(NATIVE_ETH, ethBal);
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  for (const pool of chainPools) {
+    const chainId = Number(pool.chainId);
+    const bal0 = balanceByToken.has(pool.token0.toLowerCase())
+      ? normalizeBalance(balanceByToken.get(pool.token0.toLowerCase())!, Number(pool.decimals0))
+      : 0;
+    const bal1 = balanceByToken.has(pool.token1.toLowerCase())
+      ? normalizeBalance(balanceByToken.get(pool.token1.toLowerCase())!, Number(pool.decimals1))
+      : 0;
+    const p0 = getPrice(chainId, chainKey, pool.token0);
+    const p1 = getPrice(chainId, chainKey, pool.token1);
+
+    const tvl = bal0 * p0 + bal1 * p1;
+    if (tvl <= 0) continue;
+
+    for (const addr of [pool.token0, pool.token1]) {
+      const key = `${chainId}:${addr.toLowerCase()}`;
+      tvlByToken.set(key, (tvlByToken.get(key) ?? 0) + tvl);
+    }
+  }
+
+  return tvlByToken;
+}
+
 export async function fetchLiquidityOnce(): Promise<{ updated: number }> {
   const sql = getDb();
 
@@ -107,156 +256,33 @@ export async function fetchLiquidityOnce(): Promise<{ updated: number }> {
     );
   };
 
-  const byChain = new Map<ChainKey, PoolRow[]>();
-  for (const pool of pools) {
-    const arr = byChain.get(pool.chainKey) ?? [];
-    arr.push(pool);
-    byChain.set(pool.chainKey, arr);
-  }
+  // Run V2/V3 chains in parallel
+  const byChain = groupByChain(pools);
+  const v2v3Results = await Promise.all(
+    [...byChain.entries()].map(([chainKey, chainPools]) =>
+      processV2V3Chain(chainKey, chainPools, getPrice).catch((err) => {
+        console.warn(`[fetchLiquidity] V2/V3 ${chainKey} failed: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`);
+        return new Map<string, number>();
+      }),
+    ),
+  );
 
+  // Run V4 chains in parallel
+  const v4ByChain = groupByChain(v4Pools);
+  const v4Results = await Promise.all(
+    [...v4ByChain.entries()].map(([chainKey, chainPools]) =>
+      processV4Chain(chainKey, chainPools, getPrice).catch((err) => {
+        console.warn(`[fetchLiquidity] V4 ${chainKey} failed: ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`);
+        return new Map<string, number>();
+      }),
+    ),
+  );
+
+  // Merge all TVL contributions
   const tvlByToken = new Map<string, number>();
-
-  for (const [chainKey, chainPools] of byChain) {
-    const client = getRpcClient(chainKey);
-
-    const allCalls = chainPools.flatMap((pool) => [
-      {
-        address: pool.token0 as `0x${string}`,
-        abi: ERC20_BALANCE_ABI,
-        functionName: "balanceOf" as const,
-        args: [pool.poolAddress as `0x${string}`] as const,
-      },
-      {
-        address: pool.token1 as `0x${string}`,
-        abi: ERC20_BALANCE_ABI,
-        functionName: "balanceOf" as const,
-        args: [pool.poolAddress as `0x${string}`] as const,
-      },
-    ]);
-
-    for (let offset = 0; offset < allCalls.length; offset += MULTICALL_CHUNK) {
-      const chunk = allCalls.slice(offset, offset + MULTICALL_CHUNK);
-      const chunkPools = chainPools.slice(offset / 2, (offset + MULTICALL_CHUNK) / 2);
-
-      let results: { result?: bigint; error?: Error }[] = [];
-      try {
-        results = (await client.multicall({
-          contracts: chunk,
-          allowFailure: true,
-        })) as { result?: bigint; error?: Error }[];
-      } catch {
-        continue;
-      }
-
-      for (let i = 0; i < chunkPools.length; i++) {
-        const pool = chunkPools[i];
-        if (!pool) continue;
-        const r0 = results[i * 2];
-        const r1 = results[i * 2 + 1];
-        if (!r0 || !r1) continue;
-
-        const bal0 = r0.result !== undefined ? normalizeBalance(r0.result, Number(pool.decimals0)) : 0;
-        const bal1 = r1.result !== undefined ? normalizeBalance(r1.result, Number(pool.decimals1)) : 0;
-        const p0 = getPrice(Number(pool.chainId), chainKey, pool.token0);
-        const p1 = getPrice(Number(pool.chainId), chainKey, pool.token1);
-
-        const tvl = bal0 * p0 + bal1 * p1;
-        if (tvl <= 0) continue;
-
-        for (const addr of [pool.token0, pool.token1]) {
-          const key = `${Number(pool.chainId)}:${addr.toLowerCase()}`;
-          tvlByToken.set(key, (tvlByToken.get(key) ?? 0) + tvl);
-        }
-      }
-    }
-  }
-
-  // ── V4 pools: tokens held in PoolManager singleton ──────────────────────────
-  // For ERC20 tokens, balanceOf(poolManager) gives pool-specific balance when
-  // the token only exists in one V4 pool (typical for new meme tokens).
-  // For native ETH (0x000…000) we read the PoolManager's native ETH balance.
-  const v4ByChain = new Map<ChainKey, PoolRow[]>();
-  for (const pool of v4Pools) {
-    const arr = v4ByChain.get(pool.chainKey) ?? [];
-    arr.push(pool);
-    v4ByChain.set(pool.chainKey, arr);
-  }
-
-  for (const [chainKey, chainPools] of v4ByChain) {
-    const poolManager = V4_POOL_MANAGER[chainKey];
-    if (!poolManager) continue;
-    const client = getRpcClient(chainKey);
-
-    // Dedupe by token so we only call balanceOf once per token per chain
-    const tokenSet = new Set<string>();
-    for (const pool of chainPools) {
-      tokenSet.add(pool.token0.toLowerCase());
-      tokenSet.add(pool.token1.toLowerCase());
-    }
-    const tokens = [...tokenSet];
-    const erc20Tokens = tokens.filter((t) => t !== NATIVE_ETH);
-
-    // Batch ERC20 balanceOf calls via multicall
-    const calls = erc20Tokens.map((t) => ({
-      address: t as `0x${string}`,
-      abi: ERC20_BALANCE_ABI,
-      functionName: "balanceOf" as const,
-      args: [poolManager as `0x${string}`] as const,
-    }));
-
-    // Batch ERC20 balanceOf calls via multicall, chunked to stay within RPC limits.
-    // Without chunking, 300 V4 pools → 300+ token calls in a single multicall → RPC
-    // failure silently drops all V4 liquidity (the catch is non-fatal).
-    const balanceByToken = new Map<string, bigint>();
-    for (let offset = 0; offset < calls.length; offset += MULTICALL_CHUNK) {
-      const chunk = calls.slice(offset, offset + MULTICALL_CHUNK);
-      const chunkTokens = erc20Tokens.slice(offset, offset + MULTICALL_CHUNK);
-      try {
-        const results = (await client.multicall({ contracts: chunk, allowFailure: true })) as {
-          result?: bigint;
-          error?: Error;
-        }[];
-        for (let i = 0; i < chunkTokens.length; i++) {
-          const addr = chunkTokens[i];
-          const result = results[i];
-          if (addr && result?.result !== undefined) {
-            balanceByToken.set(addr, result.result);
-          }
-        }
-      } catch {
-        // Non-fatal — continue with next chunk
-      }
-    }
-
-    // Native ETH balance of PoolManager
-    if (tokenSet.has(NATIVE_ETH)) {
-      try {
-        const ethBal = await client.getBalance({ address: poolManager as `0x${string}` });
-        balanceByToken.set(NATIVE_ETH, ethBal);
-      } catch {
-        // Non-fatal
-      }
-    }
-
-    // Compute TVL contribution for each V4 pool
-    for (const pool of chainPools) {
-      const chainId = Number(pool.chainId);
-      const bal0 = balanceByToken.has(pool.token0.toLowerCase())
-        ? normalizeBalance(balanceByToken.get(pool.token0.toLowerCase())!, Number(pool.decimals0))
-        : 0;
-      const bal1 = balanceByToken.has(pool.token1.toLowerCase())
-        ? normalizeBalance(balanceByToken.get(pool.token1.toLowerCase())!, Number(pool.decimals1))
-        : 0;
-      const p0 = getPrice(chainId, chainKey, pool.token0);
-      const p1 = getPrice(chainId, chainKey, pool.token1);
-
-      const tvl = bal0 * p0 + bal1 * p1;
-      if (tvl <= 0) continue;
-
-      for (const addr of [pool.token0, pool.token1]) {
-        const key = `${chainId}:${addr.toLowerCase()}`;
-        tvlByToken.set(key, (tvlByToken.get(key) ?? 0) + tvl);
-      }
+  for (const result of [...v2v3Results, ...v4Results]) {
+    for (const [key, tvl] of result) {
+      tvlByToken.set(key, (tvlByToken.get(key) ?? 0) + tvl);
     }
   }
 

@@ -27,23 +27,31 @@ export type DiscoveryResult = {
 export async function discoverPoolsOnce(selectedDexes: DexConfig[] = dexes): Promise<DiscoveryResult[]> {
   await runMigration();
 
-  const results: DiscoveryResult[] = [];
+  // Group DEXes by chain so we can run them in parallel
+  const byChain = new Map<string, DexConfig[]>();
   for (const dex of selectedDexes) {
-    try {
-      results.push(await discoverDexPools(dex));
-    } catch (err) {
-      // Per-DEX errors are non-fatal — log and continue to next DEX.
-      console.warn(
-        `[discoverPools] ${dex.key} failed (RPC error?): ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`,
-      );
-      results.push({
-        dexKey: dex.key,
-        fromBlock: 0n,
-        toBlock: 0n,
-        discoveredPools: 0,
-      });
-    }
+    const list = byChain.get(dex.chain) ?? [];
+    list.push(dex);
+    byChain.set(dex.chain, list);
   }
+
+  const results: DiscoveryResult[] = [];
+  const chainEntries = [...byChain.entries()];
+
+  // Run all chains in parallel
+  await Promise.all(chainEntries.map(async ([, chainDexes]) => {
+    const chainResults = await Promise.all(chainDexes.map(async (dex) => {
+      try {
+        return await discoverDexPools(dex);
+      } catch (err) {
+        console.warn(
+          `[discoverPools] ${dex.key} failed (RPC error?): ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`,
+        );
+        return { dexKey: dex.key, fromBlock: 0n, toBlock: 0n, discoveredPools: 0 };
+      }
+    }));
+    results.push(...chainResults);
+  }));
 
   return results;
 }

@@ -29,17 +29,31 @@ export type SwapIngestionResult = {
 export async function ingestSwapsOnce(selectedDexes: DexConfig[] = dexes): Promise<SwapIngestionResult[]> {
   await runMigration();
 
-  const results: SwapIngestionResult[] = [];
+  // Group DEXes by chain so we can run them in parallel
+  const byChain = new Map<string, DexConfig[]>();
   for (const dex of selectedDexes) {
-    try {
-      results.push(await ingestDexSwaps(dex));
-    } catch (err) {
-      console.warn(
-        `[ingestSwaps] ${dex.key} failed (RPC error?): ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`,
-      );
-      results.push({ dexKey: dex.key, fromBlock: 0n, toBlock: 0n, indexedSwaps: 0 });
-    }
+    const list = byChain.get(dex.chain) ?? [];
+    list.push(dex);
+    byChain.set(dex.chain, list);
   }
+
+  const results: SwapIngestionResult[] = [];
+  const chainEntries = [...byChain.entries()];
+
+  // Run all chains in parallel
+  await Promise.all(chainEntries.map(async ([, chainDexes]) => {
+    const chainResults = await Promise.all(chainDexes.map(async (dex) => {
+      try {
+        return await ingestDexSwaps(dex);
+      } catch (err) {
+        console.warn(
+          `[ingestSwaps] ${dex.key} failed (RPC error?): ${err instanceof Error ? err.message.slice(0, 120) : String(err)}`,
+        );
+        return { dexKey: dex.key, fromBlock: 0n, toBlock: 0n, indexedSwaps: 0 };
+      }
+    }));
+    results.push(...chainResults);
+  }));
 
   return results;
 }
