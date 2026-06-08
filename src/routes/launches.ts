@@ -6,15 +6,28 @@ import { listMarketTokens } from "../services/market.js";
 const VALID_PLATFORMS = new Set(launchPlatforms.map((p) => p.key));
 
 export async function registerLaunchRoutes(app: FastifyInstance) {
-  /** All launches, optionally filtered by chain / sort / platform */
+  /** All launches, optionally filtered by chain / sort / platform, with pagination. */
   app.get("/api/launches", async (request) => {
-    const query = request.query as { chain?: string; sort?: string; platform?: string; limit?: string };
-    const chain = query.chain && isChainKey(query.chain) ? query.chain : "all";
-    const sort = query.sort === "gainers" ? "gainers" : query.sort === "volume" ? "volume" : "newest";
-    const platform = query.platform && VALID_PLATFORMS.has(query.platform) ? query.platform : undefined;
-    const limit = query.limit ? Number(query.limit) : 80;
-    const tokens = await listMarketTokens(chain, sort, platform, limit);
-    return { data: tokens };
+    const query = request.query as {
+      chain?: string; sort?: string; platform?: string;
+      limit?: string; offset?: string; maxAgeDays?: string;
+    };
+    const chain       = query.chain && isChainKey(query.chain) ? query.chain : "all";
+    const sort        = query.sort === "gainers" ? "gainers" : query.sort === "volume" ? "volume" : "newest";
+    const platform    = query.platform && VALID_PLATFORMS.has(query.platform) ? query.platform : undefined;
+    const limit       = Math.min(500, Math.max(1, Number(query.limit)  || 100));
+    const offset      = Math.max(0, Number(query.offset) || 0);
+    // Default 7-day window for the Launches page; callers can override or pass 0 for no cap.
+    const maxAgeDays  = query.maxAgeDays !== undefined ? Number(query.maxAgeDays) || 0 : 7;
+
+    const tokens = await listMarketTokens(chain, sort, platform, limit, offset, maxAgeDays || undefined);
+    return {
+      data:    tokens,
+      offset,
+      limit,
+      // If we got a full page there are likely more; frontend will re-check on the next Load More.
+      hasMore: tokens.length >= limit,
+    };
   });
 
   /**

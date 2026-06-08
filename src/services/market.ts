@@ -74,10 +74,17 @@ export async function listMarketTokens(
   sort: TokenSortOrder = "volume",
   platform?: string,
   limit?: number,
+  /** SQL OFFSET for cursor-based pagination. */
+  offset = 0,
+  /**
+   * If set, only return tokens whose pool was created within the last N days.
+   * Prevents the launches list from surfacing months-old tokens on later pages.
+   */
+  maxAgeDays?: number,
 ): Promise<TokenSummary[]> {
   const sql = getDb();
-  const finalLimit = Math.max(1, Math.min(200, Math.trunc(limit ?? (sort === "newest" ? 200 : 100))));
-  const queryLimit = sort === "newest" ? Math.min(400, Math.max(finalLimit * 2, finalLimit)) : finalLimit;
+  const finalLimit = Math.max(1, Math.min(500, Math.trunc(limit ?? 100)));
+  const sqlOffset  = Math.max(0, Math.trunc(offset));
 
   const chainCondition = chain && chain !== "all"
     ? sql`AND chains."key" = ${chain}`
@@ -86,14 +93,20 @@ export async function listMarketTokens(
     ? sql`AND tokens.launch_platform = ${platform}`
     : sql``;
 
+  // Age guard — applied inside the ordered CTE after pool_rollups JOIN so that
+  // poolCreatedAt = COALESCE(block_timestamp, pool.created_at) is available.
+  // Tokens without a pool row (poolCreatedAt IS NULL) are always included so
+  // newly-seeded tokens that haven't had a pool rollup computed yet still appear.
+  const ageCondition = maxAgeDays != null
+    ? sql`(pool_rollups."poolCreatedAt" IS NULL
+           OR pool_rollups."poolCreatedAt" >= NOW() - (${maxAgeDays} * INTERVAL '1 day'))`
+    : sql`TRUE`;
+
   const orderBy =
     sort === "gainers" ? sql`candidate."priceChange24h" DESC`
     : sort === "losers"  ? sql`candidate."priceChange24h" ASC`
-    // Sort by poolCreatedAt (UTC timestamp, cross-chain comparable).
-    // poolCreatedAt = COALESCE(block_timestamp, pool.created_at) so it is almost
-    // never NULL — recently discovered pools sort correctly even before backfill.
-    // We fetch 2× the final limit and re-sort in TypeScript with chain-specific
-    // block-time estimation for an accurate cross-chain "newest first" result.
+    // poolCreatedAt = COALESCE(block_timestamp, pool.created_at) — UTC, cross-chain
+    // comparable. No TypeScript re-sort needed; SQL sort is accurate for all pages.
     : sort === "newest"  ? sql`pool_rollups."poolCreatedAt" DESC NULLS LAST`
     : sql`candidate."volume24hUsd" DESC, candidate."updatedAt" DESC`;
 
@@ -175,8 +188,10 @@ export async function listMarketTokens(
       LEFT JOIN pool_rollups
         ON pool_rollups.chain_id = candidate."chainId"
        AND pool_rollups.token_address = candidate.address
+      WHERE ${ageCondition}
       ORDER BY ${orderBy}
-      LIMIT ${queryLimit}
+      LIMIT ${finalLimit}
+      OFFSET ${sqlOffset}
     )
     SELECT
       ordered.chain,
@@ -232,17 +247,10 @@ export async function listMarketTokens(
 
   const currentBlocks = await getCurrentBlocksByChain();
   const now = Date.now();
-  const mapped = rows.map((row) => marketRowToTokenSummary(row, currentBlocks, now));
-
-  if (sort === "newest") {
-    // Re-sort using the TypeScript-computed ageMinutes, which applies chain-specific
-    // block times (base=2s, bsc=3s, eth=12s) for accurate cross-chain ordering.
-    // This corrects any residual ordering errors from the SQL timestamp approximation.
-    mapped.sort((a, b) => a.ageMinutes - b.ageMinutes);
-    return mapped.slice(0, finalLimit);
-  }
-
-  return mapped;
+  // poolCreatedAt = COALESCE(block_timestamp, pool.created_at) is a real UTC timestamp
+  // and is cross-chain comparable, so we trust SQL ORDER BY entirely — no TypeScript
+  // re-sort needed. This also makes cursor-based pagination (OFFSET) work correctly.
+  return rows.map((row) => marketRowToTokenSummary(row, currentBlocks, now));
 }
 
 export async function getMarketCandles(chain: ChainKey, address: string, interval = "5m"): Promise<Candle[]> {
