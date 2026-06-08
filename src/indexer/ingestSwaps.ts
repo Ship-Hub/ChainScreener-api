@@ -44,8 +44,19 @@ export async function ingestSwapsOnce(selectedDexes: DexConfig[] = dexes): Promi
   return results;
 }
 
+// How many pools to load for swap ingestion per DEX.
+// V4: we already fetch ALL PoolManager events and filter in memory → higher limit is free.
+// V2/V3: we batch getLogs by pool address (20/call) → keep reasonable to avoid slow RPC batches.
+const POOL_LIMIT_V4 = 10_000;
+const POOL_LIMIT_V2V3 = 500;
+
+// Max pages per ingestDexSwaps call — same rationale as discovery: clears the
+// 10,000-block startup backlog in ONE cycle instead of ~10 cycles (hours).
+const MAX_INGEST_PAGES = 20;
+
 async function ingestDexSwaps(dex: DexConfig): Promise<SwapIngestionResult> {
-  const pools = await listIndexedPoolsForDex(dex, 300);
+  const poolLimit = dex.version === "v4" ? POOL_LIMIT_V4 : POOL_LIMIT_V2V3;
+  const pools = await listIndexedPoolsForDex(dex, poolLimit);
   const client = getRpcClient(dex.chain);
   const latestBlock = await client.getBlockNumber();
   const safeLatestBlock = latestBlock > BigInt(env.INDEXER_CONFIRMATIONS) ? latestBlock - BigInt(env.INDEXER_CONFIRMATIONS) : latestBlock;
@@ -63,7 +74,10 @@ async function ingestDexSwaps(dex: DexConfig): Promise<SwapIngestionResult> {
     await backfillNewPools(dex, pools, existingCursor, safeLatestBlock);
   }
 
-  // ── Normal forward paging ─────────────────────────────────────────────────
+  // ── Multi-page forward ingestion ──────────────────────────────────────────
+  // Process up to MAX_INGEST_PAGES pages per call so the initial backlog is
+  // cleared quickly (same issue as discovery: single-page-per-cycle causes
+  // hours-long delay for live tokens created during start-up catchup).
   const newestPoolStart = pools.reduce<bigint | undefined>((min, pool) => {
     if (min === undefined) return pool.blockNumber;
     return pool.blockNumber < min ? pool.blockNumber : min;
@@ -71,36 +85,45 @@ async function ingestDexSwaps(dex: DexConfig): Promise<SwapIngestionResult> {
   const lookbackStart = safeLatestBlock > BigInt(env.INDEXER_DISCOVERY_LOOKBACK_BLOCKS)
     ? safeLatestBlock - BigInt(env.INDEXER_DISCOVERY_LOOKBACK_BLOCKS)
     : 0n;
-  const fromBlock = existingCursor ? existingCursor + 1n : newestPoolStart ?? lookbackStart;
+  const startBlock = existingCursor ? existingCursor + 1n : newestPoolStart ?? lookbackStart;
   const pageSize = Math.min(env.INDEXER_BLOCK_PAGE_SIZE, maxLogBlockRange(dex.chain));
-  const toBlock = minBlock(fromBlock + BigInt(pageSize - 1), safeLatestBlock);
 
-  if (fromBlock > toBlock) {
-    return { dexKey: dex.key, fromBlock, toBlock: safeLatestBlock, indexedSwaps: 0 };
+  if (startBlock > safeLatestBlock) {
+    return { dexKey: dex.key, fromBlock: startBlock, toBlock: safeLatestBlock, indexedSwaps: 0 };
   }
 
-  const runId = await startIndexerRun(workerName, dex.chain, dex.key, fromBlock, toBlock);
-  let indexedSwaps = 0;
+  let cursor = startBlock;
+  let totalSwaps = 0;
 
-  try {
-    const swaps = dex.version === "v4"
-      ? await fetchV4Swaps(dex, pools, fromBlock, toBlock)
-      : dex.version === "v3"
-        ? await fetchV3Swaps(dex, pools, fromBlock, toBlock)
-        : await fetchV2Swaps(dex, pools, fromBlock, toBlock);
+  for (let page = 0; page < MAX_INGEST_PAGES && cursor <= safeLatestBlock; page++) {
+    const fromBlock = cursor;
+    const toBlock = minBlock(fromBlock + BigInt(pageSize - 1), safeLatestBlock);
+    const runId = await startIndexerRun(workerName, dex.chain, dex.key, fromBlock, toBlock);
+    let pageSwaps = 0;
 
-    for (const swap of swaps) {
-      await upsertIndexedSwap(swap);
-      indexedSwaps += 1;
+    try {
+      const swaps = dex.version === "v4"
+        ? await fetchV4Swaps(dex, pools, fromBlock, toBlock)
+        : dex.version === "v3"
+          ? await fetchV3Swaps(dex, pools, fromBlock, toBlock)
+          : await fetchV2Swaps(dex, pools, fromBlock, toBlock);
+
+      for (const swap of swaps) {
+        await upsertIndexedSwap(swap);
+        pageSwaps += 1;
+      }
+
+      await setCursor(dex.chain, dex.key, workerName, toBlock);
+      await finishIndexerRun(runId, pageSwaps);
+      totalSwaps += pageSwaps;
+      cursor = toBlock + 1n;
+    } catch (error) {
+      await finishIndexerRun(runId, pageSwaps, error instanceof Error ? error.message : String(error));
+      throw error;
     }
-
-    await setCursor(dex.chain, dex.key, workerName, toBlock);
-    await finishIndexerRun(runId, indexedSwaps);
-    return { dexKey: dex.key, fromBlock, toBlock, indexedSwaps };
-  } catch (error) {
-    await finishIndexerRun(runId, indexedSwaps, error instanceof Error ? error.message : String(error));
-    throw error;
   }
+
+  return { dexKey: dex.key, fromBlock: startBlock, toBlock: cursor - 1n, indexedSwaps: totalSwaps };
 }
 
 /**

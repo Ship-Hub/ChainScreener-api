@@ -48,6 +48,15 @@ export async function discoverPoolsOnce(selectedDexes: DexConfig[] = dexes): Pro
   return results;
 }
 
+/**
+ * Maximum pages processed per `discoverDexPools` call.
+ * During initial start-up the discovery cursor can be 10,000+ blocks behind the
+ * chain tip. Without a multi-page loop, catching up at 1,000 blocks/call takes
+ * ~10+ indexer cycles (≈ hours).  Processing up to MAX_PAGES_PER_CALL pages per
+ * call means the 10,000-block backlog is cleared in ONE cycle instead of ~10.
+ */
+const MAX_CATCHUP_PAGES = 20; // 20 × 1,000 = 20,000 blocks max per call
+
 async function discoverDexPools(dex: DexConfig): Promise<DiscoveryResult> {
   const client = getRpcClient(dex.chain);
   const latestBlock = await client.getBlockNumber();
@@ -56,51 +65,61 @@ async function discoverDexPools(dex: DexConfig): Promise<DiscoveryResult> {
   const lookbackStart = safeLatestBlock > BigInt(env.INDEXER_DISCOVERY_LOOKBACK_BLOCKS)
     ? safeLatestBlock - BigInt(env.INDEXER_DISCOVERY_LOOKBACK_BLOCKS)
     : 0n;
-  const pageSize = Math.min(env.INDEXER_BLOCK_PAGE_SIZE, maxLogBlockRange(dex.chain));
-  const fromBlock = existingCursor ? existingCursor + 1n : lookbackStart;
-  const toBlock = minBlock(fromBlock + BigInt(pageSize - 1), safeLatestBlock);
+  const pageSize = BigInt(Math.min(env.INDEXER_BLOCK_PAGE_SIZE, maxLogBlockRange(dex.chain)));
+  const startBlock = existingCursor ? existingCursor + 1n : lookbackStart;
 
-  if (fromBlock > toBlock) {
-    return { dexKey: dex.key, fromBlock, toBlock: safeLatestBlock, discoveredPools: 0 };
+  if (startBlock > safeLatestBlock) {
+    return { dexKey: dex.key, fromBlock: startBlock, toBlock: safeLatestBlock, discoveredPools: 0 };
   }
 
-  const runId = await startIndexerRun(workerName, dex.chain, dex.key, fromBlock, toBlock);
-  let discoveredPools = 0;
+  // ── Multi-page catch-up loop ──────────────────────────────────────────────
+  // Process up to MAX_CATCHUP_PAGES pages per call so the initial backlog
+  // (INDEXER_DISCOVERY_LOOKBACK_BLOCKS = 10,000) is cleared in ONE cycle rather
+  // than spreading across ~10 cycles (≈ hours when the full loop is slow).
+  let cursor = startBlock;
+  let totalDiscovered = 0;
 
-  try {
-    const rawPools = await fetchPoolLogs(dex, fromBlock, toBlock);
+  for (let page = 0; page < MAX_CATCHUP_PAGES && cursor <= safeLatestBlock; page++) {
+    const fromBlock = cursor;
+    const toBlock = minBlock(fromBlock + pageSize - 1n, safeLatestBlock);
+    const runId = await startIndexerRun(workerName, dex.chain, dex.key, fromBlock, toBlock);
+    let pageDiscovered = 0;
 
-    // ── Fetch actual on-chain block timestamps for new pools ──────────────────
-    // We batch-fetch all unique block numbers so age computation is accurate.
-    // Without this, pools.created_at = DB insertion time, which is wrong for
-    // pools discovered hours after creation.
-    const blockTimestampMap = rawPools.length > 0
-      ? await fetchBlockTimestamps(dex.chain, rawPools.map((p) => p.blockNumber))
-      : new Map<bigint, Date>();
+    try {
+      const rawPools = await fetchPoolLogs(dex, fromBlock, toBlock);
 
-    for (const pool of rawPools) {
-      await upsertDiscoveredPool({ ...pool, blockTimestamp: blockTimestampMap.get(pool.blockNumber) });
-      discoveredPools += 1;
+      // Fetch actual on-chain block timestamps so token age is based on the real
+      // on-chain creation time (not the DB insertion time).
+      const blockTimestampMap = rawPools.length > 0
+        ? await fetchBlockTimestamps(dex.chain, rawPools.map((p) => p.blockNumber))
+        : new Map<bigint, Date>();
 
-      // Detect launch platform (Clanker, Bankr, etc.) by checking who sent
-      // the pool-creation transaction. Only runs on chains that have platforms.
-      if (platformChains.has(dex.chain)) {
-        const platform = await detectPoolPlatform(dex, pool.txHash as `0x${string}`);
-        if (platform) {
-          // Tag the non-quote token. If neither or both are quote assets, tag both.
-          await setTokenLaunchPlatform(dex.chain, pool.token0, platform);
-          await setTokenLaunchPlatform(dex.chain, pool.token1, platform);
+      for (const pool of rawPools) {
+        await upsertDiscoveredPool({ ...pool, blockTimestamp: blockTimestampMap.get(pool.blockNumber) });
+        pageDiscovered += 1;
+
+        // Detect launch platform (Clanker, Bankr, etc.) by checking who sent
+        // the pool-creation transaction. Only runs on chains that have platforms.
+        if (platformChains.has(dex.chain)) {
+          const platform = await detectPoolPlatform(dex, pool.txHash as `0x${string}`);
+          if (platform) {
+            await setTokenLaunchPlatform(dex.chain, pool.token0, platform);
+            await setTokenLaunchPlatform(dex.chain, pool.token1, platform);
+          }
         }
       }
-    }
 
-    await setCursor(dex.chain, dex.key, workerName, toBlock);
-    await finishIndexerRun(runId, discoveredPools);
-    return { dexKey: dex.key, fromBlock, toBlock, discoveredPools };
-  } catch (error) {
-    await finishIndexerRun(runId, discoveredPools, error instanceof Error ? error.message : String(error));
-    throw error;
+      await setCursor(dex.chain, dex.key, workerName, toBlock);
+      await finishIndexerRun(runId, pageDiscovered);
+      totalDiscovered += pageDiscovered;
+      cursor = toBlock + 1n;
+    } catch (error) {
+      await finishIndexerRun(runId, pageDiscovered, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   }
+
+  return { dexKey: dex.key, fromBlock: startBlock, toBlock: cursor - 1n, discoveredPools: totalDiscovered };
 }
 
 /**
