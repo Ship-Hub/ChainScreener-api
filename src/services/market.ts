@@ -86,10 +86,12 @@ export async function listMarketTokens(
   const orderBy =
     sort === "gainers" ? sql`tms.price_change_24h_pct DESC`
     : sort === "losers"  ? sql`tms.price_change_24h_pct ASC`
-    // Sort by the pool's on-chain block number (most recently launched first).
-    // tms.updated_at is DB-side aggregation time — wrong for "newest" because
-    // old active tokens get updated more recently than freshly-launched ones.
-    : sort === "newest"  ? sql`"poolBlockNumber" DESC NULLS LAST`
+    // Sort by poolCreatedAt (UTC timestamp, cross-chain comparable).
+    // poolCreatedAt = COALESCE(block_timestamp, pool.created_at) so it is almost
+    // never NULL — recently discovered pools sort correctly even before backfill.
+    // We fetch 2× the final limit and re-sort in TypeScript with chain-specific
+    // block-time estimation for an accurate cross-chain "newest first" result.
+    : sort === "newest"  ? sql`"poolCreatedAt" DESC NULLS LAST`
     : sql`tms.volume_24h_usd DESC, tms.updated_at DESC`;
 
   const rows = await sql<MarketTokenRow[]>`
@@ -121,7 +123,9 @@ export async function listMarketTokens(
       ) AS "dexName",
 
       (
-        SELECT MIN(p2.block_timestamp)
+        -- Prefer the real on-chain block_timestamp; fall back to DB insertion time
+        -- so that pools without a backfilled timestamp still sort by discovery order.
+        SELECT COALESCE(MIN(p2.block_timestamp), MAX(p2.created_at))
         FROM   pools p2
         WHERE  p2.chain_id = tms.chain_id
           AND  (p2.token0_address = tms.token_address OR p2.token1_address = tms.token_address)
@@ -173,12 +177,22 @@ export async function listMarketTokens(
       ${chainCondition}
       ${platformCondition}
     ORDER BY ${orderBy}
-    LIMIT ${sort === "newest" ? 200 : 100}
+    LIMIT ${sort === "newest" ? 400 : 100}
   `;
 
   const currentBlocks = await getCurrentBlocksByChain();
   const now = Date.now();
-  return rows.map((row) => marketRowToTokenSummary(row, currentBlocks, now));
+  const mapped = rows.map((row) => marketRowToTokenSummary(row, currentBlocks, now));
+
+  if (sort === "newest") {
+    // Re-sort using the TypeScript-computed ageMinutes, which applies chain-specific
+    // block times (base=2s, bsc=3s, eth=12s) for accurate cross-chain ordering.
+    // This corrects any residual ordering errors from the SQL timestamp approximation.
+    mapped.sort((a, b) => a.ageMinutes - b.ageMinutes);
+    return mapped.slice(0, 200);
+  }
+
+  return mapped;
 }
 
 export async function getMarketCandles(chain: ChainKey, address: string, interval = "5m"): Promise<Candle[]> {
