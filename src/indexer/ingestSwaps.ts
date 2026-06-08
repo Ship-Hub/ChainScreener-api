@@ -108,8 +108,8 @@ async function ingestDexSwaps(dex: DexConfig): Promise<SwapIngestionResult> {
  * current swap cursor.  Processes up to 5 pools per call, each in pages of
  * up to BACKFILL_PAGE_BLOCKS to avoid RPC timeouts.
  */
-const BACKFILL_PAGE_BLOCKS = 2_000n;
-const BACKFILL_POOLS_PER_CYCLE = 5;
+const BACKFILL_PAGE_BLOCKS = 5_000n;
+const BACKFILL_POOLS_PER_CYCLE = 10;
 
 async function backfillNewPools(
   dex: DexConfig,

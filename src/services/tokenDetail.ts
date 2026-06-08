@@ -94,7 +94,7 @@ export async function getTokenDetail(chain: ChainKey, address: string): Promise<
         ORDER BY p.created_at DESC LIMIT 1
       ) AS "dexName",
       (
-        SELECT MIN(p2.created_at) FROM pools p2
+        SELECT MIN(COALESCE(p2.block_timestamp, p2.created_at)) FROM pools p2
         WHERE p2.chain_id = tms.chain_id
           AND (p2.token0_address = tms.token_address OR p2.token1_address = tms.token_address)
       ) AS "poolCreatedAt"

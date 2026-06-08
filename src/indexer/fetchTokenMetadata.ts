@@ -20,6 +20,27 @@ export async function fetchTokenMetadataOnce() {
   await runMigration();
   const sql = getDb();
 
+  // ── Fix native/well-known tokens that can't be resolved via ERC20 multicall ─
+  // These addresses are excluded from the main loop below, so we handle them here.
+  await sql`
+    UPDATE tokens
+    SET symbol = 'ETH', name = 'Ethereum', decimals = 18, updated_at = NOW()
+    WHERE address = ${ZERO_ADDRESS} AND symbol = 'UNKNOWN'
+  `;
+  await sql`
+    UPDATE tokens
+    SET symbol = 'WETH', name = 'Wrapped Ether', decimals = 18, updated_at = NOW()
+    WHERE address IN (
+      '0x4200000000000000000000000000000000000006',
+      '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'
+    ) AND symbol = 'UNKNOWN'
+  `;
+  await sql`
+    UPDATE tokens
+    SET symbol = 'WBNB', name = 'Wrapped BNB', decimals = 18, updated_at = NOW()
+    WHERE address = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c' AND symbol = 'UNKNOWN'
+  `;
+
   const rows = await sql<UnresolvedToken[]>`
     SELECT chains."key" AS "chainKey", tokens.address
     FROM tokens

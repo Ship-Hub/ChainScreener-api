@@ -1,6 +1,6 @@
 import { closeDb } from "../db/postgres.js";
 import { env } from "../shared/env.js";
-import { discoverPoolsOnce } from "./discoverPools.js";
+import { discoverPoolsOnce, backfillMissingPoolTimestamps } from "./discoverPools.js";
 import { fetchTokenMetadataOnce } from "./fetchTokenMetadata.js";
 import { ingestSwapsOnce } from "./ingestSwaps.js";
 import { aggregateMarketOnce } from "./aggregateMarket.js";
@@ -21,12 +21,20 @@ export async function startIndexerLoop(log?: (msg: string) => void) {
     const cycleStart = Date.now();
 
     try {
-      // 1. Discover new pools
+      // 1. Discover new pools (fetches actual block timestamps for new pools)
       const poolResults = await discoverPoolsOnce();
       const newPools = poolResults.reduce((sum, r) => sum + r.discoveredPools, 0);
       if (newPools > 0) info(`[indexer] discover: +${newPools} pools`);
     } catch (error) {
       warn(`[indexer] discover error: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    try {
+      // 1b. Backfill block_timestamp for pools discovered before this feature was added
+      const backfilled = await backfillMissingPoolTimestamps();
+      if (backfilled > 0) info(`[indexer] block-timestamp backfill: ${backfilled} pools updated`);
+    } catch (error) {
+      warn(`[indexer] block-timestamp backfill error: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     try {

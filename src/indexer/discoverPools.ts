@@ -2,7 +2,7 @@ import { type Address } from "viem";
 import { dexes, type DexConfig } from "../config/dexes.js";
 import { buildPlatformLookup } from "../config/launchPlatforms.js";
 import { env } from "../shared/env.js";
-import { closeDb } from "../db/postgres.js";
+import { closeDb, getDb } from "../db/postgres.js";
 import { runMigration } from "../db/migrate.js";
 import { aerodromeV1FactoryAbi, uniswapV2FactoryAbi, uniswapV3FactoryAbi, uniswapV4PoolManagerAbi } from "./protocolEvents.js";
 import { getRpcClient } from "./rpc.js";
@@ -68,9 +68,18 @@ async function discoverDexPools(dex: DexConfig): Promise<DiscoveryResult> {
   let discoveredPools = 0;
 
   try {
-    const pools = await fetchPoolLogs(dex, fromBlock, toBlock);
-    for (const pool of pools) {
-      await upsertDiscoveredPool(pool);
+    const rawPools = await fetchPoolLogs(dex, fromBlock, toBlock);
+
+    // ── Fetch actual on-chain block timestamps for new pools ──────────────────
+    // We batch-fetch all unique block numbers so age computation is accurate.
+    // Without this, pools.created_at = DB insertion time, which is wrong for
+    // pools discovered hours after creation.
+    const blockTimestampMap = rawPools.length > 0
+      ? await fetchBlockTimestamps(dex.chain, rawPools.map((p) => p.blockNumber))
+      : new Map<bigint, Date>();
+
+    for (const pool of rawPools) {
+      await upsertDiscoveredPool({ ...pool, blockTimestamp: blockTimestampMap.get(pool.blockNumber) });
       discoveredPools += 1;
 
       // Detect launch platform (Clanker, Bankr, etc.) by checking who sent
@@ -92,6 +101,69 @@ async function discoverDexPools(dex: DexConfig): Promise<DiscoveryResult> {
     await finishIndexerRun(runId, discoveredPools, error instanceof Error ? error.message : String(error));
     throw error;
   }
+}
+
+/**
+ * Fetch actual on-chain block timestamps for a set of block numbers in parallel.
+ * Returns a Map from blockNumber → Date.
+ */
+async function fetchBlockTimestamps(chain: DexConfig["chain"], blockNumbers: bigint[]): Promise<Map<bigint, Date>> {
+  const client = getRpcClient(chain);
+  const uniqueBlocks = [...new Set(blockNumbers)];
+  const timestampMap = new Map<bigint, Date>();
+
+  // Fetch all unique blocks in parallel (typically < 20 per discovery page)
+  const settled = await Promise.allSettled(
+    uniqueBlocks.map((bn) => client.getBlock({ blockNumber: bn })),
+  );
+  for (let i = 0; i < uniqueBlocks.length; i++) {
+    const result = settled[i];
+    const bn = uniqueBlocks[i];
+    if (result?.status === "fulfilled" && bn !== undefined) {
+      timestampMap.set(bn, new Date(Number(result.value.timestamp) * 1000));
+    }
+  }
+
+  return timestampMap;
+}
+
+/**
+ * Backfill block_timestamp for pools that were discovered before this feature
+ * was added (block_timestamp IS NULL). Processes up to `limit` pools per call.
+ */
+const TIMESTAMP_BACKFILL_PER_CYCLE = 20;
+
+export async function backfillMissingPoolTimestamps(selectedDexes: DexConfig[] = dexes): Promise<number> {
+  const sql = getDb();
+  let total = 0;
+
+  for (const dex of selectedDexes) {
+    const rows = await sql`
+      SELECT pools.id, pools.block_number::bigint AS block_number
+      FROM pools
+      JOIN chains ON chains.id = pools.chain_id
+      WHERE chains."key" = ${dex.chain}
+        AND pools.block_timestamp IS NULL
+      ORDER BY pools.block_number ASC
+      LIMIT ${TIMESTAMP_BACKFILL_PER_CYCLE}
+    `;
+    if (rows.length === 0) continue;
+
+    const blockNumbers = rows.map((r) => BigInt(r.block_number as string | number));
+    const timestampMap = await fetchBlockTimestamps(dex.chain, blockNumbers);
+
+    for (const row of rows) {
+      const bn = BigInt(row.block_number as string | number);
+      const ts = timestampMap.get(bn);
+      if (!ts) continue;
+      await sql`UPDATE pools SET block_timestamp = ${ts.toISOString()} WHERE id = ${row.id}`;
+      total++;
+    }
+    // Only process the first chain with missing timestamps per call to avoid long cycles
+    if (total > 0) break;
+  }
+
+  return total;
 }
 
 async function fetchPoolLogs(dex: DexConfig, fromBlock: bigint, toBlock: bigint) {

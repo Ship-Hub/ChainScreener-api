@@ -73,7 +73,9 @@ CREATE TABLE IF NOT EXISTS pools (
 );
 
 -- Add history_fetched column if upgrading from a schema that predates it
-ALTER TABLE pools ADD COLUMN IF NOT EXISTS history_fetched BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE pools ADD COLUMN IF NOT EXISTS history_fetched  BOOLEAN     NOT NULL DEFAULT FALSE;
+-- Add block_timestamp so token age is based on actual on-chain creation time (not DB insertion time)
+ALTER TABLE pools ADD COLUMN IF NOT EXISTS block_timestamp  TIMESTAMPTZ NULL;
 
 CREATE INDEX IF NOT EXISTS idx_pools_chain_block    ON pools (chain_id, block_number);
 CREATE INDEX IF NOT EXISTS idx_pools_tokens         ON pools (chain_id, token0_address, token1_address);

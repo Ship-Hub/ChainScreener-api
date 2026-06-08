@@ -14,6 +14,8 @@ export type DiscoveredPool = {
   tickSpacing?: number;
   hookAddress?: string;
   blockNumber: bigint;
+  /** Actual on-chain timestamp of the pool creation block (fetched from RPC during discovery) */
+  blockTimestamp?: Date;
   txHash: string;
   logIndex: number;
   rawLog: unknown;
@@ -128,7 +130,7 @@ export async function upsertDiscoveredPool(pool: DiscoveredPool) {
     INSERT INTO pools (
       chain_id, dex_id, address, pool_id, protocol_version,
       token0_address, token1_address, fee, tick_spacing, hook_address,
-      block_number, tx_hash, log_index
+      block_number, block_timestamp, tx_hash, log_index
     )
     VALUES (
       ${chainId}, ${dexId},
@@ -141,6 +143,7 @@ export async function upsertDiscoveredPool(pool: DiscoveredPool) {
       ${pool.tickSpacing ?? null},
       ${pool.hookAddress?.toLowerCase() ?? null},
       ${pool.blockNumber.toString()},
+      ${pool.blockTimestamp?.toISOString() ?? null},
       ${pool.txHash},
       ${pool.logIndex}
     )
@@ -274,13 +277,34 @@ export async function upsertIndexedSwap(swap: IndexedSwap) {
   `;
 }
 
+// Native/wrapped assets whose metadata doesn't come from ERC20 calls
+const KNOWN_NATIVE_TOKENS: Record<string, { symbol: string; name: string; decimals: number }> = {
+  "0x0000000000000000000000000000000000000000": { symbol: "ETH",  name: "Ethereum",     decimals: 18 },
+  "0x4200000000000000000000000000000000000006": { symbol: "WETH", name: "Wrapped Ether", decimals: 18 },
+  "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2": { symbol: "WETH", name: "Wrapped Ether", decimals: 18 },
+  "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c": { symbol: "WBNB", name: "Wrapped BNB",   decimals: 18 },
+};
+
 async function upsertToken(chainId: number, address: string) {
   const sql = getDb();
-  await sql`
-    INSERT INTO tokens (chain_id, address)
-    VALUES (${chainId}, ${address.toLowerCase()})
-    ON CONFLICT (chain_id, address) DO UPDATE SET updated_at = NOW()
-  `;
+  const addr = address.toLowerCase();
+  const known = KNOWN_NATIVE_TOKENS[addr];
+  if (known) {
+    // Pre-seed native/wrapped tokens with correct metadata so they never show as UNKNOWN
+    await sql`
+      INSERT INTO tokens (chain_id, address, symbol, name, decimals)
+      VALUES (${chainId}, ${addr}, ${known.symbol}, ${known.name}, ${known.decimals})
+      ON CONFLICT (chain_id, address) DO UPDATE
+        SET symbol = EXCLUDED.symbol, name = EXCLUDED.name, decimals = EXCLUDED.decimals,
+            updated_at = NOW()
+    `;
+  } else {
+    await sql`
+      INSERT INTO tokens (chain_id, address)
+      VALUES (${chainId}, ${addr})
+      ON CONFLICT (chain_id, address) DO UPDATE SET updated_at = NOW()
+    `;
+  }
 }
 
 /**
