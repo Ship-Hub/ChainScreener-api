@@ -87,100 +87,147 @@ export async function listMarketTokens(
     : sql``;
 
   const orderBy =
-    sort === "gainers" ? sql`tms.price_change_24h_pct DESC`
-    : sort === "losers"  ? sql`tms.price_change_24h_pct ASC`
+    sort === "gainers" ? sql`candidate."priceChange24h" DESC`
+    : sort === "losers"  ? sql`candidate."priceChange24h" ASC`
     // Sort by poolCreatedAt (UTC timestamp, cross-chain comparable).
     // poolCreatedAt = COALESCE(block_timestamp, pool.created_at) so it is almost
     // never NULL — recently discovered pools sort correctly even before backfill.
     // We fetch 2× the final limit and re-sort in TypeScript with chain-specific
     // block-time estimation for an accurate cross-chain "newest first" result.
-    : sort === "newest"  ? sql`"poolCreatedAt" DESC NULLS LAST`
-    : sql`tms.volume_24h_usd DESC, tms.updated_at DESC`;
+    : sort === "newest"  ? sql`pool_rollups."poolCreatedAt" DESC NULLS LAST`
+    : sql`candidate."volume24hUsd" DESC, candidate."updatedAt" DESC`;
 
   const rows = await sql<MarketTokenRow[]>`
+    WITH candidate AS (
+      SELECT
+        chains.id                              AS "chainId",
+        chains."key"                          AS chain,
+        tms.token_address                     AS address,
+        COALESCE(tokens.symbol, 'UNKNOWN')    AS symbol,
+        COALESCE(tokens.name, 'Unknown Token') AS name,
+        COALESCE(tokens.decimals, 18)         AS decimals,
+        tokens.total_supply                   AS "totalSupply",
+        tokens.launch_platform                AS "launchPlatform",
+        tms.price_usd                         AS "priceUsd",
+        tms.price_change_24h_pct              AS "priceChange24h",
+        tms.volume_24h_usd                    AS "volume24hUsd",
+        tms.swaps_24h                         AS "swaps24h",
+        tms.buys_24h                          AS "buys24h",
+        tms.sells_24h                         AS "sells24h",
+        tms.liquidity_usd                     AS "liquidityUsd",
+        tms.updated_at                        AS "updatedAt"
+      FROM  token_market_stats tms
+      JOIN  chains ON chains.id = tms.chain_id
+      LEFT JOIN tokens
+              ON tokens.chain_id = tms.chain_id
+             AND tokens.address  = tms.token_address
+      WHERE TRUE
+        ${chainCondition}
+        ${platformCondition}
+    ),
+    pool_token_rows AS (
+      SELECT
+        p.chain_id,
+        p.token0_address AS token_address,
+        d.name           AS dex_name,
+        p.created_at,
+        p.block_timestamp,
+        p.block_number
+      FROM pools p
+      JOIN dexes d ON d.id = p.dex_id
+      JOIN candidate c
+        ON c."chainId" = p.chain_id
+       AND c.address = p.token0_address
+
+      UNION ALL
+
+      SELECT
+        p.chain_id,
+        p.token1_address AS token_address,
+        d.name           AS dex_name,
+        p.created_at,
+        p.block_timestamp,
+        p.block_number
+      FROM pools p
+      JOIN dexes d ON d.id = p.dex_id
+      JOIN candidate c
+        ON c."chainId" = p.chain_id
+       AND c.address = p.token1_address
+    ),
+    pool_rollups AS (
+      SELECT
+        chain_id,
+        token_address,
+        (ARRAY_AGG(dex_name ORDER BY created_at DESC))[1]       AS "dexName",
+        COALESCE(MIN(block_timestamp), MAX(created_at))         AS "poolCreatedAt",
+        MIN(block_number)                                       AS "poolBlockNumber"
+      FROM pool_token_rows
+      WHERE token_address IS NOT NULL
+      GROUP BY chain_id, token_address
+    ),
+    ordered AS (
+      SELECT
+        candidate.*,
+        pool_rollups."dexName",
+        pool_rollups."poolCreatedAt",
+        pool_rollups."poolBlockNumber"
+      FROM candidate
+      LEFT JOIN pool_rollups
+        ON pool_rollups.chain_id = candidate."chainId"
+       AND pool_rollups.token_address = candidate.address
+      ORDER BY ${orderBy}
+      LIMIT ${queryLimit}
+    )
     SELECT
-      chains."key"                          AS chain,
-      tms.token_address                     AS address,
-      COALESCE(tokens.symbol, 'UNKNOWN')    AS symbol,
-      COALESCE(tokens.name, 'Unknown Token') AS name,
-      COALESCE(tokens.decimals, 18)         AS decimals,
-      tokens.total_supply                   AS "totalSupply",
-      tokens.launch_platform                AS "launchPlatform",
-      tms.price_usd                         AS "priceUsd",
-      tms.price_change_24h_pct              AS "priceChange24h",
-      tms.volume_24h_usd                    AS "volume24hUsd",
-      tms.swaps_24h                         AS "swaps24h",
-      tms.buys_24h                          AS "buys24h",
-      tms.sells_24h                         AS "sells24h",
-      tms.liquidity_usd                     AS "liquidityUsd",
-      tms.updated_at                        AS "updatedAt",
-
-      (
-        SELECT d.name
-        FROM   pools p
-        JOIN   dexes d ON d.id = p.dex_id
-        WHERE  p.chain_id = tms.chain_id
-          AND  (p.token0_address = tms.token_address OR p.token1_address = tms.token_address)
-        ORDER  BY p.created_at DESC
-        LIMIT  1
-      ) AS "dexName",
-
-      (
-        -- Prefer the real on-chain block_timestamp; fall back to DB insertion time
-        -- so that pools without a backfilled timestamp still sort by discovery order.
-        SELECT COALESCE(MIN(p2.block_timestamp), MAX(p2.created_at))
-        FROM   pools p2
-        WHERE  p2.chain_id = tms.chain_id
-          AND  (p2.token0_address = tms.token_address OR p2.token1_address = tms.token_address)
-      ) AS "poolCreatedAt",
-
-      (
-        SELECT MIN(p2.block_number)
-        FROM   pools p2
-        WHERE  p2.chain_id = tms.chain_id
-          AND  (p2.token0_address = tms.token_address OR p2.token1_address = tms.token_address)
-      ) AS "poolBlockNumber",
+      ordered.chain,
+      ordered.address,
+      ordered.symbol,
+      ordered.name,
+      ordered.decimals,
+      ordered."totalSupply",
+      ordered."launchPlatform",
+      ordered."priceUsd",
+      ordered."priceChange24h",
+      ordered."volume24hUsd",
+      ordered."swaps24h",
+      ordered."buys24h",
+      ordered."sells24h",
+      ordered."liquidityUsd",
+      ordered."updatedAt",
+      ordered."dexName",
+      ordered."poolCreatedAt",
+      ordered."poolBlockNumber",
 
       (
         SELECT close_usd FROM token_candles_1h
-        WHERE  chain_id      = tms.chain_id
-          AND  token_address = tms.token_address
+        WHERE  chain_id      = ordered."chainId"
+          AND  token_address = ordered.address
         ORDER  BY bucket DESC
         LIMIT  1
       ) AS "candle1hNow",
       (
         SELECT close_usd FROM token_candles_1h
-        WHERE  chain_id      = tms.chain_id
-          AND  token_address = tms.token_address
+        WHERE  chain_id      = ordered."chainId"
+          AND  token_address = ordered.address
         ORDER  BY bucket DESC
         LIMIT  1 OFFSET 1
       ) AS "candle1hPrev",
 
       (
         SELECT close_usd FROM token_candles_5m
-        WHERE  chain_id      = tms.chain_id
-          AND  token_address = tms.token_address
+        WHERE  chain_id      = ordered."chainId"
+          AND  token_address = ordered.address
         ORDER  BY bucket DESC
         LIMIT  1
       ) AS "candle5mNow",
       (
         SELECT close_usd FROM token_candles_5m
-        WHERE  chain_id      = tms.chain_id
-          AND  token_address = tms.token_address
+        WHERE  chain_id      = ordered."chainId"
+          AND  token_address = ordered.address
         ORDER  BY bucket DESC
         LIMIT  1 OFFSET 1
       ) AS "candle5mPrev"
-
-    FROM  token_market_stats tms
-    JOIN  chains ON chains.id = tms.chain_id
-    LEFT JOIN tokens
-            ON tokens.chain_id = tms.chain_id
-           AND tokens.address  = tms.token_address
-    WHERE TRUE
-      ${chainCondition}
-      ${platformCondition}
-    ORDER BY ${orderBy}
-    LIMIT ${queryLimit}
+    FROM ordered
   `;
 
   const currentBlocks = await getCurrentBlocksByChain();

@@ -79,6 +79,8 @@ ALTER TABLE pools ADD COLUMN IF NOT EXISTS block_timestamp  TIMESTAMPTZ NULL;
 
 CREATE INDEX IF NOT EXISTS idx_pools_chain_block    ON pools (chain_id, block_number);
 CREATE INDEX IF NOT EXISTS idx_pools_tokens         ON pools (chain_id, token0_address, token1_address);
+CREATE INDEX IF NOT EXISTS idx_pools_token0_lookup  ON pools (chain_id, token0_address, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pools_token1_lookup  ON pools (chain_id, token1_address, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pools_needs_backfill ON pools (chain_id, dex_id, history_fetched, block_number)
   WHERE history_fetched = FALSE;
 
