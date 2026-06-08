@@ -16,6 +16,7 @@ const envSchema = z.object({
   INDEXER_DISCOVERY_LOOKBACK_BLOCKS: z.coerce.number().int().positive().default(5000),
   ENABLE_INDEXER: z.coerce.boolean().default(false),
   INDEXER_POLL_INTERVAL_SECS: z.coerce.number().int().positive().default(30),
+  LIVE_FEED_INTERVAL_MS: z.coerce.number().int().positive().min(1000).default(3000),
   ENABLE_X_FEED: z.coerce.boolean().default(false),
   X_API_KEY: z.string().optional(),
 });

@@ -11,6 +11,7 @@ import { registerMarketRoutes } from "./routes/market.js";
 import { registerSmartMoneyRoutes } from "./routes/smartMoney.js";
 import { registerAlertRoutes } from "./routes/alerts.js";
 import { registerHolderRoutes } from "./routes/holders.js";
+import { registerLiveRoutes } from "./routes/live.js";
 
 export async function buildApp() {
   const app = Fastify({ logger: true });
@@ -34,6 +35,7 @@ export async function buildApp() {
   await registerSmartMoneyRoutes(app);
   await registerAlertRoutes(app);
   await registerHolderRoutes(app);
+  await registerLiveRoutes(app);
 
   return app;
 }
