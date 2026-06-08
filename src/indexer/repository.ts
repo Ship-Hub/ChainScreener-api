@@ -1,6 +1,7 @@
 import type { ChainKey } from "../config/chains.js";
 import type { DexConfig } from "../config/dexes.js";
 import { getDb } from "../db/postgres.js";
+import { quoteAssets } from "./quoteAssets.js";
 
 export type DiscoveredPool = {
   chain: ChainKey;
@@ -148,6 +149,40 @@ export async function upsertDiscoveredPool(pool: DiscoveredPool) {
       ${pool.logIndex}
     )
     ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING
+  `;
+
+  // Seed a placeholder token_market_stats row for the new token so it appears
+  // in market listings (e.g. "Newest" tab) immediately — before any swaps are
+  // indexed and aggregated.  ON CONFLICT DO NOTHING means we never overwrite
+  // real aggregated data that may already exist for this token.
+  const quoteSet = new Set(
+    quoteAssets.filter((q) => q.chain === pool.chain).map((q) => q.address.toLowerCase()),
+  );
+  const t0 = pool.token0.toLowerCase();
+  const t1 = pool.token1.toLowerCase();
+
+  // Determine which token is the "new" one and which is the quote (WETH/USDC/etc.)
+  let baseToken: string;
+  let quoteToken: string;
+  if (quoteSet.has(t1)) {
+    baseToken = t0; quoteToken = t1;
+  } else if (quoteSet.has(t0)) {
+    baseToken = t1; quoteToken = t0;
+  } else {
+    // Neither is a known quote — seed t0, treat t1 as quote
+    baseToken = t0; quoteToken = t1;
+  }
+
+  await sql`
+    INSERT INTO token_market_stats (
+      chain_id, token_address, quote_address,
+      price_usd, price_change_24h_pct, volume_24h_usd,
+      swaps_24h, buys_24h, sells_24h
+    ) VALUES (
+      ${chainId}, ${baseToken}, ${quoteToken},
+      0, 0, 0, 0, 0, 0
+    )
+    ON CONFLICT (chain_id, token_address) DO NOTHING
   `;
 }
 

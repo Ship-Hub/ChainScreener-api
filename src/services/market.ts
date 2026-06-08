@@ -86,7 +86,10 @@ export async function listMarketTokens(
   const orderBy =
     sort === "gainers" ? sql`tms.price_change_24h_pct DESC`
     : sort === "losers"  ? sql`tms.price_change_24h_pct ASC`
-    : sort === "newest"  ? sql`tms.updated_at DESC`
+    // Sort by the pool's on-chain block number (most recently launched first).
+    // tms.updated_at is DB-side aggregation time — wrong for "newest" because
+    // old active tokens get updated more recently than freshly-launched ones.
+    : sort === "newest"  ? sql`"poolBlockNumber" DESC NULLS LAST`
     : sql`tms.volume_24h_usd DESC, tms.updated_at DESC`;
 
   const rows = await sql<MarketTokenRow[]>`
@@ -170,7 +173,7 @@ export async function listMarketTokens(
       ${chainCondition}
       ${platformCondition}
     ORDER BY ${orderBy}
-    LIMIT 50
+    LIMIT ${sort === "newest" ? 200 : 100}
   `;
 
   const currentBlocks = await getCurrentBlocksByChain();
