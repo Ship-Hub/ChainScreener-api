@@ -11,7 +11,7 @@ export type LiveFeedSnapshot = {
 
 export async function getLiveFeedSnapshot(): Promise<LiveFeedSnapshot> {
   const [tokens, livePools, liveSwaps] = await Promise.all([
-    listMarketTokens("all", "volume"),
+    listMarketTokens("all", "newest", undefined, 100, 0, 7),
     getRecentDiscoveredPools(12),
     getRecentIndexedSwaps(12),
   ]);
